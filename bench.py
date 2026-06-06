@@ -10,6 +10,7 @@ from toyvllm.generation import (
     generate_greedy_cached,
     generate_greedy_naive,
 )
+from toyvllm.sampling import SamplingParams
 from toyvllm.tokenizer import ChatMessage, Tokenizer
 from toyvllm.weight_loader import load_model
 
@@ -33,6 +34,11 @@ def main() -> None:
         help="重复用户 prompt，用于观察长上下文下的性能变化",
     )
     parser.add_argument("--label", default=None)
+    parser.add_argument("--sample", action="store_true")
+    parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--top-p", type=float, default=None)
+    parser.add_argument("--seed", type=int, default=123)
     parser.add_argument(
         "--save",
         default=None,
@@ -78,7 +84,13 @@ def run_generation_benchmark(
     warmup = 1 if args.warmup is None else args.warmup
     iterations = 3 if args.iterations is None else args.iterations
     label = args.label or (
-        "stage-05-kv-cache" if args.backend == "cached" else "stage-04-naive"
+        "stage-06-sampling"
+        if args.sample
+        else (
+            "stage-05-kv-cache"
+            if args.backend == "cached"
+            else "stage-04-naive"
+        )
     )
     config = ModelConfig.from_pretrained(args.model)
     if args.prompt_repeat <= 0:
@@ -87,6 +99,24 @@ def run_generation_benchmark(
     messages: list[ChatMessage] = [{"role": "user", "content": prompt_text}]
     prompt_token_ids = tokenizer.encode_chat(messages, enable_thinking=False)
     loaded = load_model(config, device="cuda")
+    sampling_params = SamplingParams(
+        temperature=(
+            config.generation_temperature
+            if args.sample and args.temperature is None
+            else (args.temperature or 0.0)
+        ),
+        top_k=(
+            config.generation_top_k
+            if args.sample and args.top_k is None
+            else (args.top_k or 0)
+        ),
+        top_p=(
+            config.generation_top_p
+            if args.sample and args.top_p is None
+            else (1.0 if args.top_p is None else args.top_p)
+        ),
+        seed=args.seed if args.sample else None,
+    )
     generate_function = (
         generate_greedy_cached
         if args.backend == "cached"
@@ -99,6 +129,7 @@ def run_generation_benchmark(
             prompt_token_ids,
             max_new_tokens=args.max_new_tokens,
             eos_token_ids=set(config.generation_eos_token_ids),
+            sampling_params=sampling_params,
         )
 
     for _ in range(warmup):
@@ -119,7 +150,8 @@ def run_generation_benchmark(
         "peak_memory_mib": max(result.peak_memory_mib for result in results),
         "model_load_seconds": loaded.load_seconds,
     }
-    print(f"{args.backend.capitalize()} greedy generation")
+    strategy = "greedy" if sampling_params.is_greedy else "sampling"
+    print(f"{args.backend.capitalize()} {strategy} generation")
     print(f"  模型加载 : {metrics['model_load_seconds']:.2f} s")
     print(f"  平均 TTFT: {metrics['mean_ttft_ms']:.2f} ms")
     print(f"  平均 TPOT: {metrics['mean_tpot_ms']:.2f} ms")
@@ -139,7 +171,13 @@ def run_generation_benchmark(
                 "prompt_tokens": len(prompt_token_ids),
                 "max_new_tokens": args.max_new_tokens,
                 "warmup": warmup,
-                "decoding": "greedy",
+                "decoding": strategy,
+                "sampling": {
+                    "temperature": sampling_params.temperature,
+                    "top_k": sampling_params.top_k,
+                    "top_p": sampling_params.top_p,
+                    "seed": sampling_params.seed,
+                },
             },
         )
         print(f"\n结果已追加到：{args.save}")

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 
 from toyvllm.models.qwen3 import Qwen3ForCausalLM
+from toyvllm.sampling import SamplingParams, create_generator, sample_next_token
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,7 @@ def generate_greedy_naive(
     *,
     max_new_tokens: int,
     eos_token_ids: set[int],
+    sampling_params: SamplingParams | None = None,
 ) -> GenerationResult:
     """最朴素生成：每产生一个 token，都重新计算完整序列。"""
 
@@ -53,6 +55,8 @@ def generate_greedy_naive(
         raise ValueError("max_new_tokens 必须大于 0")
 
     device = next(model.parameters()).device
+    params = sampling_params or SamplingParams()
+    generator = create_generator(params, device)
     input_ids = torch.tensor([prompt_token_ids], dtype=torch.long, device=device)
     output_token_ids: list[int] = []
     step_seconds: list[float] = []
@@ -66,7 +70,11 @@ def generate_greedy_naive(
         started = time.perf_counter()
 
         logits = model(input_ids, last_token_only=True)
-        next_token = logits[:, -1].argmax(dim=-1)
+        next_token = sample_next_token(
+            logits[:, -1],
+            params,
+            generator=generator,
+        )
 
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -96,6 +104,7 @@ def generate_greedy_cached(
     *,
     max_new_tokens: int,
     eos_token_ids: set[int],
+    sampling_params: SamplingParams | None = None,
 ) -> GenerationResult:
     """使用连续 KV Cache：prefill 处理 prompt，decode 每次只处理一个 token。"""
 
@@ -105,6 +114,8 @@ def generate_greedy_cached(
         raise ValueError("max_new_tokens 必须大于 0")
 
     device = next(model.parameters()).device
+    params = sampling_params or SamplingParams()
+    generator = create_generator(params, device)
     current_input = torch.tensor(
         [prompt_token_ids],
         dtype=torch.long,
@@ -128,7 +139,11 @@ def generate_greedy_cached(
             past_key_values=past_key_values,
             use_cache=True,
         )
-        next_token = logits[:, -1].argmax(dim=-1)
+        next_token = sample_next_token(
+            logits[:, -1],
+            params,
+            generator=generator,
+        )
 
         if device.type == "cuda":
             torch.cuda.synchronize(device)

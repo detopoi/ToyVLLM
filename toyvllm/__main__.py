@@ -5,6 +5,7 @@ import argparse
 from toyvllm.config import ModelConfig
 from toyvllm.environment import inspect_environment
 from toyvllm.generation import generate_greedy_cached, generate_greedy_naive
+from toyvllm.sampling import SamplingParams
 from toyvllm.tokenizer import ChatMessage, Tokenizer
 from toyvllm.weight_loader import load_model
 
@@ -23,7 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="启用 Qwen3 thinking 模式",
     )
 
-    generate_parser = subparsers.add_parser("generate", help="运行朴素 greedy 推理")
+    generate_parser = subparsers.add_parser("generate", help="运行文本生成")
     generate_parser.add_argument("prompt", nargs="?", default="用一句话解释 KV Cache。")
     generate_parser.add_argument("--max-new-tokens", type=int, default=16)
     generate_parser.add_argument("--thinking", action="store_true")
@@ -33,6 +34,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="cached",
         help="naive 每步重算完整序列；cached 复用 KV Cache",
     )
+    generate_parser.add_argument(
+        "--sample",
+        action="store_true",
+        help="使用模型 generation_config.json 中的采样参数",
+    )
+    generate_parser.add_argument("--temperature", type=float, default=None)
+    generate_parser.add_argument("--top-k", type=int, default=None)
+    generate_parser.add_argument("--top-p", type=float, default=None)
+    generate_parser.add_argument("--seed", type=int, default=None)
     return parser
 
 
@@ -68,6 +78,32 @@ def main() -> None:
         )
 
         loaded = load_model(config, device="cuda")
+        sampling_requested = args.sample or any(
+            value is not None
+            for value in (args.temperature, args.top_k, args.top_p, args.seed)
+        )
+        if sampling_requested:
+            sampling_params = SamplingParams(
+                temperature=(
+                    config.generation_temperature
+                    if args.temperature is None
+                    else args.temperature
+                ),
+                top_k=(
+                    config.generation_top_k
+                    if args.top_k is None
+                    else args.top_k
+                ),
+                top_p=(
+                    config.generation_top_p
+                    if args.top_p is None
+                    else args.top_p
+                ),
+                seed=args.seed,
+            )
+        else:
+            sampling_params = SamplingParams()
+
         generate = (
             generate_greedy_cached
             if args.backend == "cached"
@@ -78,9 +114,20 @@ def main() -> None:
             prompt_token_ids,
             max_new_tokens=args.max_new_tokens,
             eos_token_ids=set(config.generation_eos_token_ids),
+            sampling_params=sampling_params,
         )
         print(f"模型加载：{loaded.load_seconds:.2f} s")
         print(f"推理后端：{args.backend}")
+        if sampling_params.is_greedy:
+            print("解码策略：greedy")
+        else:
+            print(
+                "解码策略：sampling "
+                f"(temperature={sampling_params.temperature}, "
+                f"top_k={sampling_params.top_k}, "
+                f"top_p={sampling_params.top_p}, "
+                f"seed={sampling_params.seed})"
+            )
         print(f"输入 token：{len(prompt_token_ids)}")
         print(f"输出 token：{len(result.output_token_ids)}")
         print(f"TTFT：{result.ttft_ms:.2f} ms")

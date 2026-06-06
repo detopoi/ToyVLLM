@@ -578,16 +578,128 @@ naive 每轮重新处理整段序列，矩阵较大，GPU 利用率较高。cach
 
 后续 Paged KV Cache 和 Attention 优化会继续处理这些问题。
 
+### 2026-06-06：完成第 6 步，采样策略
+
+此前生成过程固定使用 greedy：
+
+```text
+next_token = argmax(logits)
+```
+
+它每次选择 logits 最大的 token，因此相同输入总是得到相同结果。Greedy 适合作为性能
+benchmark 和正确性对照，但容易让开放式文本变得单调。
+
+本次新增 `SamplingParams` 和独立采样器，支持：
+
+- `temperature`
+- `top-k`
+- `top-p`
+- 固定随机种子
+
+处理顺序如下：
+
+```text
+原始 logits
+  ↓ 除以 temperature
+调整概率分布的尖锐程度
+  ↓ top-k
+只保留 logits 最高的 k 个 token
+  ↓ top-p
+保留累计概率刚达到 p 的最小候选集合
+  ↓ softmax + multinomial
+按剩余概率随机抽取一个 token
+```
+
+#### Temperature
+
+采样概率来自：
+
+```text
+softmax(logits / temperature)
+```
+
+- temperature 小于 1：概率分布更尖锐，更偏向高概率 token
+- temperature 大于 1：概率分布更平坦，输出更随机
+- temperature 等于 0：项目约定为 greedy，不进行除法
+
+#### Top-k
+
+`top_k=20` 表示每一步只允许 logits 最高的 20 个 token 参与采样，其余 token 的
+logits 被设置为负无穷，softmax 后概率变成 0。
+
+#### Top-p
+
+Top-p 也叫 nucleus sampling。它先按概率从高到低排序，再保留累计概率刚好达到阈值的
+最小集合。候选数量不是固定的：模型很确定时可能只留下少量 token，不确定时会留下更多。
+
+例如概率为：
+
+```text
+[0.64, 0.24, 0.09, 0.03]
+```
+
+使用 `top_p=0.8` 时保留前两个 token，因为 `0.64 + 0.24 = 0.88`，第一次超过 0.8。
+
+#### 随机种子
+
+随机数生成器在一次请求开始时创建，并在整个生成过程中持续使用。不能每生成一个 token
+就重新设置 seed，否则每一步都会从同一个随机状态开始，破坏正常的随机序列。
+
+相同模型、输入、参数和 seed 会产生相同 token 序列。真实 Qwen3 验证结果：
+
+```text
+seed=123 第一次 == seed=123 第二次
+seed=123 输出 != seed=456 输出
+sampling 输出 != greedy 输出
+```
+
+Qwen3 本地 `generation_config.json` 的推荐参数是：
+
+```text
+temperature = 0.6
+top_k       = 20
+top_p       = 0.95
+```
+
+默认命令仍使用 greedy，保证性能数据可重复比较。增加 `--sample` 才会采用上述参数：
+
+```powershell
+& $PYTHON -m toyvllm --model Qwen3-1.7B generate --sample --seed 123 `
+    --max-new-tokens 32 "写一句关于夜空的短句。"
+```
+
+#### Benchmark 结果
+
+相同 cached 后端、18-token 输入、16-token 输出、warmup 1、iterations 3：
+
+| 策略 | TTFT | TPOT | Decode 吞吐 | 峰值显存 |
+|---|---:|---:|---:|---:|
+| greedy | 29.95 ms | 29.96 ms | 33.40 tokens/s | 3892.1 MiB |
+| sampling | 31.17 ms | 30.60 ms | 32.68 tokens/s | 3893.7 MiB |
+
+本次实现中采样让 Decode 吞吐下降约 2.2%，峰值显存增加约 1.6 MiB。这是为了获得更多样
+输出所支付的计算成本，不是性能优化。跨阶段性能 benchmark 仍固定使用 greedy。
+
+测试覆盖：
+
+- Greedy 一定选择最大 logits
+- Top-k 恰好保留 k 个候选
+- Top-p 保留最小 nucleus
+- 非法 temperature、top-k、top-p 会提前报错
+- 相同 seed 可复现采样序列
+- Naive 和 cached 后端在相同 seed 下输出一致
+
 ### 当前验证结果
 
 ```text
-18 个测试全部通过
+24 个测试全部通过
 Python compileall 通过
 CUDA、BF16、真实权重加载通过
 Tokenizer 普通文本往返和聊天模板测试通过
 单层结果与 Transformers 官方 Qwen3 对齐
 真实 Qwen3-1.7B greedy 生成通过
 Naive 与 cached 生成结果一致
+Greedy 与 sampling 均可运行，采样结果可复现
 多种上下文长度的 benchmark 已写入 benchmarks/results.jsonl
 ```
 
@@ -600,7 +712,7 @@ Naive 与 cached 生成结果一致
 - [x] 第 3 步：组装模型并加载权重
 - [x] 第 4 步：朴素文本生成
 - [x] 第 5 步：连续 KV Cache
-- [ ] 第 6 步：采样策略
+- [x] 第 6 步：采样策略
 - [ ] 第 7 步：静态批处理
 - [ ] 第 8 步：连续批处理与调度器
 - [ ] 第 9 步：Paged KV Cache
