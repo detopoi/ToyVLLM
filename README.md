@@ -126,4 +126,13 @@ $PYTHON = "C:\Users\Administrator\AppData\Local\Programs\Python\Python310\python
 
 Paged KV Cache 当前完成了第一阶段：`BlockManager` 和物理 KV Block 池。此阶段主要通过
 `tests/test_block_manager.py` 和 `tests/test_paged_kv_cache.py` 学习分配与映射语义，
-尚未替换模型 Attention 的缓存读取路径。
+并已完成第二阶段 Engine 接入。运行分页后端：
+
+```powershell
+& $PYTHON -m toyvllm continuous --cache-backend paged `
+    --num-kv-blocks 64 --block-size 16 --max-num-seqs 4 `
+    "你好" "解释 KV Cache" "描述夏天"
+```
+
+当前 Attention 前仍会把离散 Block gather 成临时连续 Cache；这个瓶颈将在 9C
+Paged Attention 阶段处理。

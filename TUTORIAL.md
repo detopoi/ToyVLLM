@@ -1324,10 +1324,212 @@ tensor.index_fill_(dim=1, index=ids, value=0)
 
 在原 Tensor 上完成写回。
 
+### 2026-06-06：第 9B 步，Engine 接入分页缓存
+
+9A 只有独立的 BlockManager 和物理池。9B 把它们接入真实请求生命周期：
+
+```text
+请求进入 WAITING
+  ↓ 不占 KV Block
+Scheduler 接纳为 RUNNING
+  ↓ 按 Prompt 长度分配 Block
+Prefill
+  ↓ 把 Prompt K/V 写入物理池
+Decode
+  ↓ 每轮 reserve(1)，只写新增 token 的 K/V
+请求完成
+  ↓ 释放 Block Table 中全部物理块
+```
+
+新增 `PagedContinuousBatchEngine`，复用已有的 Sequence、Scheduler、采样器和调度轮次。
+它只替换缓存资源管理，不复制一套新的调度策略。
+
+#### WAITING 请求为什么不提前分配
+
+等待队列可能很长。如果请求刚进入系统就按 Prompt 分配显存，大量尚未运行的请求会占满
+KV Block，反而让真正 RUNNING 的请求无法继续 Decode。
+
+因此：
+
+```text
+WAITING：只有 CPU 上的 prompt token 和状态
+RUNNING：拥有 Block Table 和物理 KV Block
+FINISHED：Block 已回收到空闲池
+```
+
+Block 的生命周期与 RUNNING 状态对齐。
+
+#### Admission 同时检查两个资源
+
+旧 Scheduler 只检查：
+
+```text
+running 数量 < max_num_seqs
+```
+
+分页后还需要检查：
+
+```text
+Prompt 所需 Block 数 <= 当前空闲 Block 数
+```
+
+分页引擎按 FIFO 查看队首请求。如果队首 Prompt 暂时放不下：
+
+- 存在 RUNNING 请求：停止接纳，等待它们释放 Block
+- 没有 RUNNING 请求：抛出 `OutOfBlocksError`，因为系统不可能自行取得进展
+
+当前严格 FIFO 不会绕过大请求去接纳后面的小请求。这样保证公平性，但可能产生
+Head-of-Line Blocking。生产系统可以增加优先级或 backfilling 策略，但必须明确它们对
+公平性和饥饿的影响。
+
+#### Prefill 如何写入分页池
+
+Scheduler 接纳请求后，BlockManager 根据完整 Prompt 长度创建 Block Table。
+模型 Prefill 仍然用左 padding 组成规则 batch，返回：
+
+```text
+每层 K/V [batch, kv_heads, padded_prompt_length, head_dim]
+```
+
+`write_prefill_batch` 根据 attention mask 去掉每行 padding，然后按该请求 Block Table
+写入物理池。Padding 从来不会占用长期 KV Block。
+
+#### Decode 的读写顺序
+
+本阶段 Attention 还不能直接读取物理块，所以每轮先执行：
+
+```text
+Block Table + 物理池
+  ↓ read_batch
+临时连续历史 Cache
+  ↓ 模型 Decode
+历史 Cache + 当前 token 的 Present Cache
+```
+
+然后只取 Present Cache 的最后一列，也就是当前 token 的 K/V，写入新物理槽位。
+
+关键顺序是：
+
+```text
+1. 使用旧 Block Table gather 历史 Cache
+2. reserve_many，为本轮新 token 分配槽位
+3. 执行模型
+4. 把 Present 最后一列写入新槽位
+```
+
+不能先 reserve 再 gather。reserve 会把 `num_tokens` 增加一，如果这时 read_batch，
+它会尝试读取尚未写入的新槽位。
+
+#### 为什么需要 reserve_many
+
+一个 Decode Batch 中可能有四条请求同时跨过 Block 边界，每条都需要一个新 Block。
+如果分别调用：
+
+```text
+can_reserve(A) -> True
+can_reserve(B) -> True
+can_reserve(C) -> True
+can_reserve(D) -> True
+```
+
+它们可能都看到了同一批空闲 Block。`reserve_many` 会先汇总整个 batch 的新增块需求，
+确认总量足够后再修改任何 Block Table。
+
+因此容量不足时，所有请求保持原状，不会出现一半请求增长、一半请求失败的 batch。
+
+#### 请求完成时回收什么
+
+连续引擎完成请求时删除：
+
+```text
+request_id -> 连续 KV Tensor
+request_id -> 随机数生成器
+```
+
+分页引擎完成请求时删除：
+
+```text
+request_id -> Block Table
+物理 Block -> 回到 free queue
+request_id -> 随机数生成器
+```
+
+真实模型测试使用 32 个 Block。四条请求全部完成后：
+
+```text
+结束后空闲 Blocks：32/32
+```
+
+说明逻辑运行槽、Block Table 和物理显存块的生命周期已经闭环。
+
+#### 9B 与 9C 的边界
+
+9B 已经做到：
+
+- 请求不持有不断增长的连续 KV Tensor
+- KV 显存由固定物理池统一预分配
+- 每轮只写新增 token 的 K/V
+- Block 容量参与 Scheduler admission
+- 请求结束后 Block 可立即复用
+
+9B 仍然没有做到：
+
+- Attention 直接按照 Block Table 读取 K/V
+- 避免每轮 `read_batch` gather
+- 避免不同长度请求的临时 padding
+- 使用专门的 Paged Attention CUDA/Triton kernel
+
+因此 9B 是“分页存储 + 连续 Attention”的过渡版本。
+
+#### Benchmark
+
+工作负载与 Scheduler 阶段相同：
+
+```text
+请求数       8
+最大并发     4
+Prompt       18 token
+生成上限     [4, 16, 4, 16, 4, 16, 4, 16]
+Block Pool   64 blocks
+Block Size   16 tokens
+```
+
+结果：
+
+| 缓存后端 | 总输出吞吐 | 峰值显存 |
+|---|---:|---:|
+| 请求级连续 Cache | 58.77 tokens/s | 3939.8 MiB |
+| Paged 9B | 60.73 tokens/s | 4026.0 MiB |
+
+分页存储吞吐提高约 3%。它不再把模型返回的整段历史 Cache 拆回每条请求，只写最后一个
+token，因此抵消了一部分物理池 gather 成本。
+
+峰值显存增加约 86 MiB，因为分页池按 64 个 Block 预分配：
+
+```text
+64 * 1.75 MiB = 112 MiB KV Block Pool
+```
+
+当前工作负载很短，旧后端本来也只需要少量 Cache，因此固定池看起来更贵。服务系统中预分配
+不是纯浪费：它把显存容量变成明确、稳定、无碎片的 Block Budget，避免运行时频繁申请显存。
+
+这组 3% 提升不是 Paged Attention 的最终收益。9C 的核心验收指标是移除 `read_batch`
+产生的 gather/padding，并重新测量 Scheduler 混合长度工作负载。
+
+#### 本阶段验证
+
+- 分页引擎输出与逐条 cached generation 一致
+- Block 容量不足会让 FIFO 请求等待
+- Decode Batch 的多请求 reserve 具有原子性
+- Prefill Padding 不写入物理池
+- Decode 每轮只写一个新增 K/V
+- 非连续物理块可组成正确 Attention 历史
+- 所有请求结束后物理块全部回收
+
 ### 当前验证结果
 
 ```text
-43 个测试全部通过
+48 个测试全部通过
 Python compileall 通过
 CUDA、BF16、真实权重加载通过
 Tokenizer 普通文本往返和聊天模板测试通过
@@ -1338,6 +1540,7 @@ Greedy 与 sampling 均可运行，采样结果可复现
 不同长度静态 batch 与逐请求结果一致
 Scheduler 状态转换、FIFO、在线 arrival 和动态 admission 通过
 Paged Block 分配、回收、离散映射和 K/V 读写通过
+Paged Engine Prefill、Decode、Admission 与完整 Block 回收通过
 多种上下文长度的 benchmark 已写入 benchmarks/results.jsonl
 ```
 
@@ -1355,7 +1558,7 @@ Paged Block 分配、回收、离散映射和 K/V 读写通过
 - [x] 第 8 步：连续批处理与调度器
 - [ ] 第 9 步：Paged KV Cache
   - [x] 第 9A 步：Block Manager 与物理 KV Block 池
-  - [ ] 第 9B 步：Engine 接入分页缓存
+  - [x] 第 9B 步：Engine 接入分页缓存
   - [ ] 第 9C 步：Paged Attention 直接按 Block Table 读取
 - [ ] 第 10 步：性能测量与优化
 - [ ] 第 11 步：HTTP 服务（可选）

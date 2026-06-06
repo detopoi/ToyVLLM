@@ -53,7 +53,18 @@ class SchedulerTest(unittest.TestCase):
         self.assertEqual(sequence.finished_step, 1)
         self.assertTrue(scheduler.is_done)
 
+    def test_admission_can_be_limited_to_one_request(self) -> None:
+        scheduler = Scheduler(max_num_seqs=3)
+        for token in range(3):
+            scheduler.add_request(
+                [token],
+                max_new_tokens=1,
+                eos_token_ids=set(),
+            )
+        admitted = scheduler.admit_waiting(step=0, max_sequences=1)
+        self.assertEqual(len(admitted), 1)
+        self.assertEqual(len(scheduler.waiting), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
-

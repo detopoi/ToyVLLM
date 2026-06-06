@@ -8,7 +8,11 @@ import torch
 
 from toyvllm.benchmark import append_record, append_result, benchmark
 from toyvllm.config import ModelConfig
-from toyvllm.engine import ContinuousBatchEngine, ContinuousBatchResult
+from toyvllm.engine import (
+    ContinuousBatchEngine,
+    ContinuousBatchResult,
+    PagedContinuousBatchEngine,
+)
 from toyvllm.generation import (
     BatchGenerationResult,
     GenerationResult,
@@ -26,7 +30,14 @@ def main() -> None:
     parser.add_argument("--model", default="Qwen3-1.7B")
     parser.add_argument(
         "--backend",
-        choices=("tokenizer", "naive", "cached", "static", "continuous"),
+        choices=(
+            "tokenizer",
+            "naive",
+            "cached",
+            "static",
+            "continuous",
+            "paged",
+        ),
         default="tokenizer",
     )
     parser.add_argument("--warmup", type=int, default=None)
@@ -48,6 +59,8 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-requests", type=int, default=8)
     parser.add_argument("--short-new-tokens", type=int, default=4)
+    parser.add_argument("--num-kv-blocks", type=int, default=64)
+    parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument(
         "--save",
         default=None,
@@ -56,6 +69,9 @@ def main() -> None:
     args = parser.parse_args()
 
     tokenizer = Tokenizer(args.model)
+    if args.backend == "paged":
+        run_paged_benchmark(args, tokenizer)
+        return
     if args.backend == "continuous":
         run_scheduler_benchmark(args, tokenizer)
         return
@@ -112,6 +128,130 @@ def resolve_sampling_params(
         top_p=config.generation_top_p if args.top_p is None else args.top_p,
         seed=args.seed,
     )
+
+
+def run_paged_benchmark(
+    args: argparse.Namespace,
+    tokenizer: Tokenizer,
+) -> None:
+    """同一 Scheduler 工作负载下比较连续请求 Cache 与分页物理池。"""
+
+    if args.batch_size <= 0 or args.num_requests <= 0:
+        raise ValueError("--batch-size 和 --num-requests 必须大于 0")
+    warmup = 1 if args.warmup is None else args.warmup
+    iterations = 3 if args.iterations is None else args.iterations
+    label = args.label or "stage-09b-paged-engine"
+    config = ModelConfig.from_pretrained(args.model)
+    prompt_ids = tokenizer.encode_chat(
+        [{"role": "user", "content": args.prompt}],
+        enable_thinking=False,
+    )
+    prompts = [prompt_ids] * args.num_requests
+    limits = [
+        args.short_new_tokens if index % 2 == 0 else args.max_new_tokens
+        for index in range(args.num_requests)
+    ]
+    loaded = load_model(config, device="cuda")
+    sampling_params = resolve_sampling_params(args, config)
+
+    def run_engine(paged: bool) -> ContinuousBatchResult:
+        if paged:
+            engine = PagedContinuousBatchEngine(
+                loaded.model,
+                max_num_seqs=args.batch_size,
+                pad_token_id=tokenizer.pad_token_id,
+                num_blocks=args.num_kv_blocks,
+                block_size=args.block_size,
+            )
+        else:
+            engine = ContinuousBatchEngine(
+                loaded.model,
+                max_num_seqs=args.batch_size,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        for prompt, limit in zip(prompts, limits):
+            engine.add_request(
+                prompt,
+                max_new_tokens=limit,
+                eos_token_ids=set(config.generation_eos_token_ids),
+                sampling_params=sampling_params,
+            )
+        return engine.run()
+
+    for _ in range(warmup):
+        run_engine(False)
+        run_engine(True)
+
+    continuous_results = []
+    paged_results = []
+    for iteration in range(iterations):
+        if iteration % 2 == 0:
+            continuous_results.append(run_engine(False))
+            paged_results.append(run_engine(True))
+        else:
+            paged_results.append(run_engine(True))
+            continuous_results.append(run_engine(False))
+
+    continuous_seconds = sum(
+        result.total_seconds for result in continuous_results
+    )
+    paged_seconds = sum(result.total_seconds for result in paged_results)
+    continuous_tokens = sum(
+        result.total_output_tokens for result in continuous_results
+    )
+    paged_tokens = sum(result.total_output_tokens for result in paged_results)
+    continuous_tps = continuous_tokens / continuous_seconds
+    paged_tps = paged_tokens / paged_seconds
+    metrics = {
+        "backend": "paged",
+        "max_num_seqs": args.batch_size,
+        "num_requests": args.num_requests,
+        "iterations": iterations,
+        "continuous_tokens_per_second": continuous_tps,
+        "paged_tokens_per_second": paged_tps,
+        "speedup": paged_tps / continuous_tps,
+        "continuous_peak_memory_mib": max(
+            result.peak_memory_mib for result in continuous_results
+        ),
+        "paged_peak_memory_mib": max(
+            result.peak_memory_mib for result in paged_results
+        ),
+        "num_kv_blocks": args.num_kv_blocks,
+        "block_size": args.block_size,
+    }
+
+    print("Paged Engine 9B: continuous cache vs physical block pool")
+    print(f"  请求数/最大并发 : {args.num_requests}/{args.batch_size}")
+    print(f"  生成上限       : {limits}")
+    print(
+        f"  KV Blocks      : {args.num_kv_blocks} × "
+        f"{args.block_size} tokens"
+    )
+    print(f"  Continuous 吞吐: {continuous_tps:.2f} tokens/s")
+    print(f"  Paged 9B 吞吐  : {paged_tps:.2f} tokens/s")
+    print(f"  吞吐倍率       : {metrics['speedup']:.2f}x")
+    print(
+        "  Continuous/Paged 峰值显存: "
+        f"{metrics['continuous_peak_memory_mib']:.1f} / "
+        f"{metrics['paged_peak_memory_mib']:.1f} MiB"
+    )
+
+    if args.save:
+        append_record(
+            args.save,
+            label=label,
+            metrics=metrics,
+            metadata={
+                "model": args.model,
+                "prompt_tokens": len(prompt_ids),
+                "request_max_new_tokens": limits,
+                "warmup": warmup,
+                "decoding": (
+                    "greedy" if sampling_params.is_greedy else "sampling"
+                ),
+            },
+        )
+        print(f"\n结果已追加到：{args.save}")
 
 
 def run_scheduler_benchmark(

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 
 from toyvllm.config import ModelConfig
-from toyvllm.engine import ContinuousBatchEngine
+from toyvllm.engine import ContinuousBatchEngine, PagedContinuousBatchEngine
 from toyvllm.environment import inspect_environment
 from toyvllm.generation import (
     generate_greedy_cached,
@@ -123,6 +123,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     continuous_parser.add_argument("--max-new-tokens", type=int, default=16)
     continuous_parser.add_argument("--max-num-seqs", type=int, default=4)
+    continuous_parser.add_argument(
+        "--cache-backend",
+        choices=("continuous", "paged"),
+        default="continuous",
+    )
+    continuous_parser.add_argument("--num-kv-blocks", type=int, default=64)
+    continuous_parser.add_argument("--block-size", type=int, default=16)
     continuous_parser.add_argument("--thinking", action="store_true")
     continuous_parser.add_argument(
         "--show-schedule",
@@ -233,11 +240,20 @@ def main() -> None:
         tokenizer = Tokenizer(args.model)
         sampling_params = resolve_sampling_params(args, config)
         loaded = load_model(config, device="cuda")
-        engine = ContinuousBatchEngine(
-            loaded.model,
-            max_num_seqs=args.max_num_seqs,
-            pad_token_id=tokenizer.pad_token_id,
-        )
+        if args.cache_backend == "paged":
+            engine = PagedContinuousBatchEngine(
+                loaded.model,
+                max_num_seqs=args.max_num_seqs,
+                pad_token_id=tokenizer.pad_token_id,
+                num_blocks=args.num_kv_blocks,
+                block_size=args.block_size,
+            )
+        else:
+            engine = ContinuousBatchEngine(
+                loaded.model,
+                max_num_seqs=args.max_num_seqs,
+                pad_token_id=tokenizer.pad_token_id,
+            )
         for prompt in args.prompts:
             prompt_ids = tokenizer.encode_chat(
                 [{"role": "user", "content": prompt}],
@@ -254,12 +270,24 @@ def main() -> None:
         print(f"模型加载：{loaded.load_seconds:.2f} s")
         print(f"请求数：{len(args.prompts)}")
         print(f"最大并发：{args.max_num_seqs}")
+        print(f"缓存后端：{args.cache_backend}")
+        if args.cache_backend == "paged":
+            print(
+                f"KV Blocks：{args.num_kv_blocks} × "
+                f"{args.block_size} tokens"
+            )
         print(f"解码策略：{format_sampling_params(sampling_params)}")
         print(f"调度轮数：{len(result.iterations)}")
         print(f"总输出吞吐：{result.output_tokens_per_second:.2f} tokens/s")
         print(f"请求吞吐：{result.requests_per_second:.2f} requests/s")
         print(f"完成顺序：{list(result.completion_order)}")
         print(f"峰值显存：{result.peak_memory_mib:.1f} MiB")
+        if args.cache_backend == "paged":
+            print(
+                "结束后空闲 Blocks："
+                f"{engine.block_manager.stats.num_free_blocks}/"
+                f"{engine.block_manager.stats.num_total_blocks}"
+            )
 
         if args.show_schedule:
             print("\n调度轨迹：")

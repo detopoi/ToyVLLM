@@ -11,6 +11,8 @@ from dataclasses import dataclass
 
 import torch
 
+from toyvllm.block_manager import BlockManager, OutOfBlocksError
+from toyvllm.kv_cache import PagedKVCache
 from toyvllm.layers.attention import KVCache
 from toyvllm.models.qwen3 import Qwen3ForCausalLM
 from toyvllm.sampling import SamplingParams, sample_next_token
@@ -183,7 +185,7 @@ class ContinuousBatchEngine:
         decode_seconds = self._execute_decode(decode_sequences, step=step)
 
         # 这里只返回新接纳请求。旧 running 已经在上面 Decode 过，不能再 Prefill。
-        prefill_sequences = self.scheduler.admit_waiting(step=step)
+        prefill_sequences = self._admit_waiting(step=step)
         prefill_seconds = self._execute_prefill(prefill_sequences, step=step)
 
         iteration = EngineIteration(
@@ -200,6 +202,11 @@ class ContinuousBatchEngine:
         self._iterations.append(iteration)
         self._step_index += 1
         return iteration
+
+    def _admit_waiting(self, *, step: int) -> tuple[Sequence, ...]:
+        """连续 Tensor 后端只受 max_num_seqs 限制。分页后端会覆盖此资源钩子。"""
+
+        return self.scheduler.admit_waiting(step=step)
 
     def _ensure_execution_started(self) -> None:
         """第一次 step 时初始化计时，后续在线请求不会重置全局时间线。"""
@@ -481,3 +488,220 @@ class ContinuousBatchEngine:
     def _stop_timing(self) -> None:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
+
+
+class PagedContinuousBatchEngine(ContinuousBatchEngine):
+    """使用 BlockManager 和共享物理 KV Block 池的连续批处理引擎。
+
+    这是 9B 过渡实现：
+
+    - 请求长期状态已经存放在分页物理池；
+    - Prefill 和 Decode 只写本轮新增的 K/V；
+    - 请求结束后按 Block Table 回收物理块；
+    - Attention 前仍通过 read_batch gather 成连续历史 Cache。
+
+    最后一项 gather 要到 9C Paged Attention 才能消除。
+    """
+
+    def __init__(
+        self,
+        model: Qwen3ForCausalLM,
+        *,
+        max_num_seqs: int,
+        pad_token_id: int,
+        num_blocks: int,
+        block_size: int = 16,
+    ) -> None:
+        super().__init__(
+            model,
+            max_num_seqs=max_num_seqs,
+            pad_token_id=pad_token_id,
+        )
+        config = model.config
+        parameter = next(model.parameters())
+        self.block_manager = BlockManager(
+            num_blocks=num_blocks,
+            block_size=block_size,
+        )
+        self.paged_cache = PagedKVCache(
+            num_layers=config.num_hidden_layers,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+            dtype=parameter.dtype,
+            device=parameter.device,
+        )
+
+        # 父类的 _caches 属于连续 Tensor 后端。分页后端不使用它，
+        # 保留空字典仅是为了维持父类初始化契约。
+        self._caches.clear()
+
+    def _admit_waiting(self, *, step: int) -> tuple[Sequence, ...]:
+        """同时受运行槽位和空闲 KV Block 约束的 FIFO admission。"""
+
+        admitted: list[Sequence] = []
+        while (
+            self.scheduler.waiting
+            and len(self.scheduler.running) < self.scheduler.max_num_seqs
+        ):
+            candidate = self.scheduler.waiting[0]
+            required = self.block_manager.blocks_required_for_tokens(
+                len(candidate.prompt_token_ids)
+            )
+            if required > self.block_manager.stats.num_free_blocks:
+                # 严格 FIFO：队首暂时放不下时，不绕过它接纳后面的短请求。
+                # 如果当前没有 RUNNING 请求可释放块，则系统已无法取得进展。
+                if not self.scheduler.running:
+                    raise OutOfBlocksError(
+                        f"队首请求 {candidate.request_id} 的 Prompt 需要 "
+                        f"{required} 个 Block，但仅剩 "
+                        f"{self.block_manager.stats.num_free_blocks} 个"
+                    )
+                break
+
+            sequence = self.scheduler.admit_waiting(
+                step=step,
+                max_sequences=1,
+            )[0]
+            # allocate 在模型 Prefill 前建立 Block Table。只有真正被接纳的请求
+            # 才占物理块，WAITING 请求不提前占用 GPU Cache。
+            self.block_manager.allocate(
+                sequence.request_id,
+                num_tokens=len(sequence.prompt_token_ids),
+            )
+            admitted.append(sequence)
+        return tuple(admitted)
+
+    def _execute_prefill(
+        self,
+        sequences: tuple[Sequence, ...],
+        *,
+        step: int,
+    ) -> float:
+        if not sequences:
+            return 0.0
+
+        max_length = max(len(sequence.prompt_token_ids) for sequence in sequences)
+        input_rows = []
+        mask_rows = []
+        for sequence in sequences:
+            padding = max_length - len(sequence.prompt_token_ids)
+            input_rows.append(
+                [self.pad_token_id] * padding + sequence.prompt_token_ids
+            )
+            mask_rows.append([0] * padding + [1] * len(sequence.prompt_token_ids))
+
+        input_ids = torch.tensor(input_rows, dtype=torch.long, device=self.device)
+        attention_mask = torch.tensor(
+            mask_rows,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        started = self._start_timing()
+        logits, packed_cache = self.model(
+            input_ids,
+            last_token_only=True,
+            attention_mask=attention_mask,
+            use_cache=True,
+        )
+        self._stop_timing()
+        elapsed = time.perf_counter() - started
+
+        tables = tuple(
+            self.block_manager.get_block_table(sequence.request_id)
+            for sequence in sequences
+        )
+        self.paged_cache.write_prefill_batch(
+            tables,
+            packed_cache,
+            attention_mask,
+        )
+
+        next_tokens = self._sample_rows(logits[:, -1], sequences)
+        for index, sequence in enumerate(sequences):
+            finish_reason = self.scheduler.append_token(
+                sequence,
+                int(next_tokens[index].item()),
+                step=step,
+            )
+            if finish_reason is not None:
+                self._finish_seconds[sequence.request_id] = (
+                    time.perf_counter() - self._run_started
+                )
+                self._release(sequence.request_id)
+        return elapsed
+
+    def _execute_decode(
+        self,
+        sequences: tuple[Sequence, ...],
+        *,
+        step: int,
+    ) -> float:
+        if not sequences:
+            return 0.0
+
+        old_tables = tuple(
+            self.block_manager.get_block_table(sequence.request_id)
+            for sequence in sequences
+        )
+        packed_cache, attention_mask = self.paged_cache.read_batch(old_tables)
+
+        # read_batch 必须发生在 reserve_many 之前。reserve 会把 num_tokens 加一，
+        # 新槽位此时尚未写入，若先 reserve 再 read 就会 gather 未初始化数据。
+        slots = self.block_manager.reserve_many(
+            tuple((sequence.request_id, 1) for sequence in sequences)
+        )
+
+        input_ids = torch.tensor(
+            [[sequence.last_token_id] for sequence in sequences],
+            dtype=torch.long,
+            device=self.device,
+        )
+        attention_mask = torch.cat(
+            (
+                attention_mask,
+                torch.ones(
+                    (len(sequences), 1),
+                    dtype=attention_mask.dtype,
+                    device=self.device,
+                ),
+            ),
+            dim=1,
+        )
+
+        started = self._start_timing()
+        logits, packed_present = self.model(
+            input_ids,
+            last_token_only=True,
+            attention_mask=attention_mask,
+            past_key_values=packed_cache,
+            use_cache=True,
+        )
+        self._stop_timing()
+        elapsed = time.perf_counter() - started
+
+        self.paged_cache.write_decode_batch(
+            tuple(slots[sequence.request_id] for sequence in sequences),
+            packed_present,
+        )
+        next_tokens = self._sample_rows(logits[:, -1], sequences)
+        for index, sequence in enumerate(sequences):
+            finish_reason = self.scheduler.append_token(
+                sequence,
+                int(next_tokens[index].item()),
+                step=step,
+            )
+            if finish_reason is not None:
+                self._finish_seconds[sequence.request_id] = (
+                    time.perf_counter() - self._run_started
+                )
+                self._release(sequence.request_id)
+        return elapsed
+
+    def _release(self, request_id: int) -> None:
+        """回收 Block Table 中的全部物理块，并释放请求随机流。"""
+
+        self.block_manager.free(request_id)
+        self._generators.pop(request_id, None)

@@ -165,6 +165,102 @@ class PagedKVCache:
             layers.append((key, value))
         return layers
 
+    def read_batch(
+        self,
+        tables: tuple[BlockTable, ...],
+    ) -> tuple[list[KVCache], torch.Tensor]:
+        """把多条分页请求临时 gather 成模型当前接口需要的连续 Batch。
+
+        这是 9B 的过渡接口。它仍会产生 padding 和复制；9C Paged Attention 将直接接收
+        物理块池与 Block Table，届时不再构造这份连续历史 Cache。
+        """
+
+        if not tables:
+            raise ValueError("tables 不能为空")
+        compact = [self.read(table) for table in tables]
+        lengths = [table.num_tokens for table in tables]
+        max_length = max(lengths)
+        attention_mask = torch.tensor(
+            [
+                [0] * (max_length - length) + [1] * length
+                for length in lengths
+            ],
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        packed: list[KVCache] = []
+        for layer_index in range(self.shape.num_layers):
+            keys = []
+            values = []
+            for request_layers, length in zip(compact, lengths):
+                key, value = request_layers[layer_index]
+                padding = max_length - length
+                if padding:
+                    key_padding = key.new_zeros(
+                        (1, self.shape.num_kv_heads, padding, self.shape.head_dim)
+                    )
+                    value_padding = value.new_zeros(
+                        (1, self.shape.num_kv_heads, padding, self.shape.head_dim)
+                    )
+                    key = torch.cat((key_padding, key), dim=2)
+                    value = torch.cat((value_padding, value), dim=2)
+                keys.append(key)
+                values.append(value)
+            packed.append((torch.cat(keys, dim=0), torch.cat(values, dim=0)))
+        return packed, attention_mask
+
+    def write_prefill_batch(
+        self,
+        tables: tuple[BlockTable, ...],
+        packed_cache: list[KVCache],
+        attention_mask: torch.Tensor,
+    ) -> None:
+        """把左 Padding 的 Prefill Batch 拆成请求，并写入各自物理块。"""
+
+        if len(tables) != attention_mask.shape[0]:
+            raise ValueError("BlockTable 数量与 batch size 不一致")
+        valid_masks = attention_mask.to(torch.bool)
+        for batch_index, table in enumerate(tables):
+            valid = valid_masks[batch_index]
+            layer_values: list[KVCache] = []
+            for key, value in packed_cache:
+                layer_values.append(
+                    (
+                        key[batch_index : batch_index + 1, :, valid, :],
+                        value[batch_index : batch_index + 1, :, valid, :],
+                    )
+                )
+            self.write(table.slots(), layer_values)
+
+    def write_decode_batch(
+        self,
+        slots_by_request: tuple[tuple[PhysicalTokenSlot, ...], ...],
+        packed_present: list[KVCache],
+    ) -> None:
+        """只把本轮 Decode 新增的最后一个 K/V 写入物理池。
+
+        packed_present 包含“临时连续历史 + 当前 token”。当前 token 始终位于最后一列，
+        因此无需把整段历史拆回并重写。
+        """
+
+        batch_size = len(slots_by_request)
+        if any(len(slots) != 1 for slots in slots_by_request):
+            raise ValueError("当前 Decode 每条请求必须恰好新增一个 token")
+        if not packed_present or packed_present[0][0].shape[0] != batch_size:
+            raise ValueError("packed_present 的 batch size 不一致")
+
+        for batch_index, slots in enumerate(slots_by_request):
+            layer_values: list[KVCache] = []
+            for key, value in packed_present:
+                layer_values.append(
+                    (
+                        key[batch_index : batch_index + 1, :, -1:, :],
+                        value[batch_index : batch_index + 1, :, -1:, :],
+                    )
+                )
+            self.write(slots, layer_values)
+
     def clear_blocks(self, block_ids: tuple[int, ...] | list[int]) -> None:
         """可选地清零释放块，便于测试或有数据隔离要求的场景。
 

@@ -87,15 +87,27 @@ class Scheduler:
         # finished 中保留的是结果，不属于待执行工作，因此不参与 done 判断。
         return not self._waiting and not self._running
 
-    def admit_waiting(self, *, step: int) -> tuple[Sequence, ...]:
+    def admit_waiting(
+        self,
+        *,
+        step: int,
+        max_sequences: int | None = None,
+    ) -> tuple[Sequence, ...]:
         """按 FIFO 顺序用等待请求填满空闲运行槽位。
 
         返回值只包含“本轮刚刚接纳”的请求。Engine 会对它们执行 Prefill；
         已经在 running 中的旧请求则走 Decode，二者不能混淆。
         """
 
+        if max_sequences is not None and max_sequences <= 0:
+            raise ValueError("max_sequences 必须大于 0")
+
         admitted: list[Sequence] = []
-        while self._waiting and len(self._running) < self.max_num_seqs:
+        while (
+            self._waiting
+            and len(self._running) < self.max_num_seqs
+            and (max_sequences is None or len(admitted) < max_sequences)
+        ):
             sequence = self._waiting.popleft()
 
             # 状态修改和运行集合插入放在同一个方法中，维持不变量：

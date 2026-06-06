@@ -100,6 +100,58 @@ class PagedKVCacheTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.cache.write(table.slots(), invalid)
 
+    def test_batch_read_and_incremental_decode_write(self) -> None:
+        first_table = self.manager.allocate(1, num_tokens=2)
+        second_table = self.manager.allocate(2, num_tokens=1)
+        first = make_layer_cache(
+            num_layers=2,
+            num_heads=2,
+            num_tokens=2,
+            head_dim=3,
+            start=0,
+        )
+        second = make_layer_cache(
+            num_layers=2,
+            num_heads=2,
+            num_tokens=1,
+            head_dim=3,
+            start=100,
+        )
+        self.cache.write(first_table.slots(), first)
+        self.cache.write(second_table.slots(), second)
+
+        packed, mask = self.cache.read_batch((first_table, second_table))
+        self.assertEqual(mask.tolist(), [[1, 1], [0, 1]])
+        self.assertEqual(packed[0][0].shape, (2, 2, 2, 3))
+
+        slots = self.manager.reserve_many(((1, 1), (2, 1)))
+        present = []
+        for layer in range(2):
+            key = torch.cat(
+                (
+                    packed[layer][0],
+                    torch.full((2, 2, 1, 3), 500 + layer),
+                ),
+                dim=2,
+            )
+            value = torch.cat(
+                (
+                    packed[layer][1],
+                    torch.full((2, 2, 1, 3), 900 + layer),
+                ),
+                dim=2,
+            )
+            present.append((key, value))
+        self.cache.write_decode_batch(
+            (slots[1], slots[2]),
+            present,
+        )
+
+        restored_first = self.cache.read(self.manager.get_block_table(1))
+        restored_second = self.cache.read(self.manager.get_block_table(2))
+        self.assertTrue(torch.all(restored_first[0][0][:, :, -1] == 500))
+        self.assertTrue(torch.all(restored_second[1][1][:, :, -1] == 901))
+
 
 if __name__ == "__main__":
     unittest.main()
