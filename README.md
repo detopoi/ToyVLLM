@@ -25,11 +25,13 @@ $PYTHON = "C:\Users\Administrator\AppData\Local\Programs\Python\Python310\python
 & $PYTHON -m toyvllm --model Qwen3-1.7B tokenize "你好，请介绍一下自己。"
 ```
 
-运行当前最朴素的 greedy 推理：
+运行使用 KV Cache 的 greedy 推理：
 
 ```powershell
 & $PYTHON -m toyvllm --model Qwen3-1.7B generate --max-new-tokens 16 "你好"
 ```
+
+需要运行旧的重算基线时增加 `--backend naive`。
 
 运行测试：
 
@@ -54,4 +56,18 @@ $PYTHON = "C:\Users\Administrator\AppData\Local\Programs\Python\Python310\python
 ```powershell
 & $PYTHON bench.py --backend naive --warmup 1 --iterations 3 `
     --max-new-tokens 16 --save benchmarks/results.jsonl --label stage-04-naive
+```
+
+运行相同配置的 KV Cache 基准：
+
+```powershell
+& $PYTHON bench.py --backend cached --warmup 1 --iterations 3 `
+    --max-new-tokens 16 --save benchmarks/results.jsonl --label stage-05-kv-cache
+```
+
+观察长上下文下 KV Cache 的收益：
+
+```powershell
+& $PYTHON bench.py --backend cached --prompt-repeat 168 `
+    --warmup 1 --iterations 3 --max-new-tokens 16
 ```
