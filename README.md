@@ -123,3 +123,7 @@ $PYTHON = "C:\Users\Administrator\AppData\Local\Programs\Python\Python310\python
     --num-requests 8 --short-new-tokens 4 --max-new-tokens 16 `
     --warmup 1 --iterations 3
 ```
+
+Paged KV Cache 当前完成了第一阶段：`BlockManager` 和物理 KV Block 池。此阶段主要通过
+`tests/test_block_manager.py` 和 `tests/test_paged_kv_cache.py` 学习分配与映射语义，
+尚未替换模型 Attention 的缓存读取路径。

@@ -133,3 +133,10 @@ class ModelConfig:
         if num_tokens < 0:
             raise ValueError("num_tokens 不能为负数")
         return self.kv_cache_bytes_per_token * num_tokens / 1024**2
+
+    def kv_cache_block_mib(self, block_size: int) -> float:
+        """一个跨全部模型层的物理 KV Block 占用多少 MiB。"""
+
+        if block_size <= 0:
+            raise ValueError("block_size 必须大于 0")
+        return self.kv_cache_mib(block_size)
