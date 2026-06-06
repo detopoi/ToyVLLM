@@ -42,6 +42,27 @@ $PYTHON = "C:\Users\Administrator\AppData\Local\Programs\Python\Python310\python
 
 也可以通过 `--temperature`、`--top-k` 和 `--top-p` 覆盖模型默认值。
 
+所有采样超参数都能独立指定；只要传入任意一个就会启用采样：
+
+```powershell
+& $PYTHON -m toyvllm generate --temperature 0.8 --top-k 40 `
+    --top-p 0.9 --seed 123 "写一句关于夜空的短句。"
+```
+
+静态批处理不同长度的请求：
+
+```powershell
+& $PYTHON -m toyvllm batch --max-new-tokens 16 `
+    "你好" "用一句话解释 KV Cache。" "请用三个词描述夏天。"
+```
+
+运行带 Scheduler 的连续批处理并查看每轮轨迹：
+
+```powershell
+& $PYTHON -m toyvllm continuous --max-num-seqs 2 --show-schedule `
+    "你好" "解释 KV Cache" "描述夏天" "什么是 GPU"
+```
+
 运行测试：
 
 ```powershell
@@ -86,4 +107,19 @@ $PYTHON = "C:\Users\Administrator\AppData\Local\Programs\Python\Python310\python
 ```powershell
 & $PYTHON bench.py --backend cached --sample --seed 123 `
     --warmup 1 --iterations 3 --max-new-tokens 16
+```
+
+测量静态 batch：
+
+```powershell
+& $PYTHON bench.py --backend static --batch-size 4 `
+    --warmup 1 --iterations 3 --max-new-tokens 16
+```
+
+对比静态与连续调度：
+
+```powershell
+& $PYTHON bench.py --backend continuous --batch-size 4 `
+    --num-requests 8 --short-new-tokens 4 --max-new-tokens 16 `
+    --warmup 1 --iterations 3
 ```

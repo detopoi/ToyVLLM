@@ -64,6 +64,7 @@ class Qwen3Attention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
         past_key_value: KVCache | None = None,
         use_cache: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, KVCache]:
@@ -113,23 +114,60 @@ class Qwen3Attention(nn.Module):
         # 没有历史缓存的 prefill 可以使用 SDPA 内置因果掩码。带缓存时 query 的
         # 第 0 个位置实际对应 past_length，而不是整段序列的位置 0，需要显式
         # 构造带偏移的 mask。单 token decode 位于序列末尾，可以看到全部历史。
-        attention_mask = None
-        is_causal = past_key_value is None and sequence_length > 1
-        if past_key_value is not None and sequence_length > 1:
+        sdpa_mask = None
+        has_padding = attention_mask is not None
+        is_causal = (
+            past_key_value is None
+            and sequence_length > 1
+            and not has_padding
+        )
+        if has_padding:
+            if attention_mask.ndim != 2:
+                raise ValueError("attention_mask 的形状必须是 [batch, key_sequence]")
+            if attention_mask.shape != (batch_size, key.shape[2]):
+                raise ValueError(
+                    "attention_mask 长度必须覆盖历史缓存和当前输入"
+                )
+
+            key_is_valid = attention_mask.to(torch.bool)[:, None, None, :]
             key_positions = torch.arange(key.shape[2], device=key.device)
             query_positions = torch.arange(
                 past_length,
                 past_length + sequence_length,
                 device=query.device,
             )
-            attention_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
-            attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)
+            causal = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+            sdpa_mask = key_is_valid & causal[None, None, :, :]
+
+            # 左 padding 的 query 本身也处在无效位置，正常结果不会被读取。但如果
+            # 一整行 key 都被屏蔽，某些 SDPA 后端会返回 NaN，并通过残差污染后续层。
+            # 因此只让无效 query 看见自己的 padding key；真实 query 仍看不见任何 pad。
+            query_is_valid = attention_mask[
+                :, past_length : past_length + sequence_length
+            ].to(torch.bool)
+            self_only = (
+                key_positions.unsqueeze(0) == query_positions.unsqueeze(1)
+            )[None, None, :, :]
+            sdpa_mask = torch.where(
+                query_is_valid[:, None, :, None],
+                sdpa_mask,
+                self_only,
+            )
+        elif past_key_value is not None and sequence_length > 1:
+            key_positions = torch.arange(key.shape[2], device=key.device)
+            query_positions = torch.arange(
+                past_length,
+                past_length + sequence_length,
+                device=query.device,
+            )
+            sdpa_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+            sdpa_mask = sdpa_mask.unsqueeze(0).unsqueeze(0)
 
         attended = F.scaled_dot_product_attention(
             query,
             key,
             value,
-            attn_mask=attention_mask,
+            attn_mask=sdpa_mask,
             dropout_p=0.0,
             is_causal=is_causal,
         )

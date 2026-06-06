@@ -105,3 +105,51 @@ def sample_next_token(
         num_samples=1,
         generator=generator,
     ).squeeze(-1)
+
+
+def create_generators(
+    params: SamplingParams,
+    device: torch.device,
+    batch_size: int,
+) -> list[torch.Generator | None]:
+    """为 batch 中每条请求创建独立随机流。
+
+    第 i 条请求使用 seed+i。这样第一条请求单独运行或放进 batch 时仍会得到相同结果，
+    其他请求也不会因为前一条请求多抽了一次随机数而改变后续采样。
+    """
+
+    if params.is_greedy:
+        return [None] * batch_size
+    if params.seed is None:
+        return [create_generator(params, device) for _ in range(batch_size)]
+
+    generators = []
+    for index in range(batch_size):
+        generator = torch.Generator(device=device)
+        generator.manual_seed(params.seed + index)
+        generators.append(generator)
+    return generators
+
+
+def sample_batch(
+    logits: torch.Tensor,
+    params: SamplingParams,
+    generators: list[torch.Generator | None],
+) -> torch.Tensor:
+    if logits.shape[0] != len(generators):
+        raise ValueError("generator 数量必须和 batch size 一致")
+    if params.is_greedy:
+        return sample_next_token(logits, params)
+
+    # torch.multinomial 只接收一个 generator。逐行采样让每条请求拥有独立随机流，
+    # 这是请求可复现性比少量 Python 循环更重要的地方。
+    return torch.stack(
+        [
+            sample_next_token(
+                logits[index : index + 1],
+                params,
+                generator=generators[index],
+            )[0]
+            for index in range(logits.shape[0])
+        ]
+    )

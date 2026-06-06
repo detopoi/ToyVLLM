@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import argparse
 import statistics
+import time
+
+import torch
 
 from toyvllm.benchmark import append_record, append_result, benchmark
 from toyvllm.config import ModelConfig
+from toyvllm.engine import ContinuousBatchEngine, ContinuousBatchResult
 from toyvllm.generation import (
+    BatchGenerationResult,
     GenerationResult,
     generate_greedy_cached,
     generate_greedy_naive,
+    generate_static_batch,
 )
 from toyvllm.sampling import SamplingParams
 from toyvllm.tokenizer import ChatMessage, Tokenizer
@@ -20,7 +26,7 @@ def main() -> None:
     parser.add_argument("--model", default="Qwen3-1.7B")
     parser.add_argument(
         "--backend",
-        choices=("tokenizer", "naive", "cached"),
+        choices=("tokenizer", "naive", "cached", "static", "continuous"),
         default="tokenizer",
     )
     parser.add_argument("--warmup", type=int, default=None)
@@ -38,7 +44,10 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--top-p", type=float, default=None)
-    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--num-requests", type=int, default=8)
+    parser.add_argument("--short-new-tokens", type=int, default=4)
     parser.add_argument(
         "--save",
         default=None,
@@ -47,6 +56,12 @@ def main() -> None:
     args = parser.parse_args()
 
     tokenizer = Tokenizer(args.model)
+    if args.backend == "continuous":
+        run_scheduler_benchmark(args, tokenizer)
+        return
+    if args.backend == "static":
+        run_static_batch_benchmark(args, tokenizer)
+        return
     if args.backend in {"naive", "cached"}:
         run_generation_benchmark(args, tokenizer)
         return
@@ -74,7 +89,278 @@ def main() -> None:
             metadata={"model": args.model, "text_tokens": token_count},
         )
         print(f"\n结果已追加到：{args.save}")
-    print("\n模型推理 benchmark：python bench.py --backend naive")
+    print("\n模型推理 benchmark：python bench.py --backend cached")
+
+
+def resolve_sampling_params(
+    args: argparse.Namespace,
+    config: ModelConfig,
+) -> SamplingParams:
+    requested = args.sample or any(
+        value is not None
+        for value in (args.temperature, args.top_k, args.top_p, args.seed)
+    )
+    if not requested:
+        return SamplingParams()
+    return SamplingParams(
+        temperature=(
+            config.generation_temperature
+            if args.temperature is None
+            else args.temperature
+        ),
+        top_k=config.generation_top_k if args.top_k is None else args.top_k,
+        top_p=config.generation_top_p if args.top_p is None else args.top_p,
+        seed=args.seed,
+    )
+
+
+def run_scheduler_benchmark(
+    args: argparse.Namespace,
+    tokenizer: Tokenizer,
+) -> None:
+    if args.batch_size <= 0 or args.num_requests <= 0:
+        raise ValueError("--batch-size 和 --num-requests 必须大于 0")
+    if not 0 < args.short_new_tokens <= args.max_new_tokens:
+        raise ValueError("--short-new-tokens 必须在 1 到 max-new-tokens 之间")
+
+    warmup = 1 if args.warmup is None else args.warmup
+    iterations = 3 if args.iterations is None else args.iterations
+    label = args.label or "stage-08-continuous-batch"
+    config = ModelConfig.from_pretrained(args.model)
+    prompt_ids = tokenizer.encode_chat(
+        [{"role": "user", "content": args.prompt}],
+        enable_thinking=False,
+    )
+    prompts = [prompt_ids] * args.num_requests
+    limits = [
+        args.short_new_tokens if index % 2 == 0 else args.max_new_tokens
+        for index in range(args.num_requests)
+    ]
+    loaded = load_model(config, device="cuda")
+    sampling_params = resolve_sampling_params(args, config)
+
+    def run_static_workload() -> dict[str, object]:
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
+        started = time.perf_counter()
+        total_tokens = 0
+        completion_seconds: list[float] = []
+        for offset in range(0, args.num_requests, args.batch_size):
+            batch_prompts = prompts[offset : offset + args.batch_size]
+            batch_limits = limits[offset : offset + args.batch_size]
+            batch_started_at = time.perf_counter() - started
+            result = generate_static_batch(
+                loaded.model,
+                batch_prompts,
+                max_new_tokens=batch_limits,
+                eos_token_ids=set(config.generation_eos_token_ids),
+                pad_token_id=tokenizer.pad_token_id,
+                sampling_params=sampling_params,
+            )
+            total_tokens += result.total_output_tokens
+            completion_seconds.extend(
+                batch_started_at + seconds
+                for seconds in result.completion_seconds
+            )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - started
+        peak = (
+            torch.cuda.max_memory_allocated() / 1024**2
+            if torch.cuda.is_available()
+            else 0.0
+        )
+        return {
+            "seconds": elapsed,
+            "tokens": float(total_tokens),
+            "peak_memory_mib": peak,
+            "completion_seconds": completion_seconds,
+        }
+
+    def run_continuous_workload() -> ContinuousBatchResult:
+        engine = ContinuousBatchEngine(
+            loaded.model,
+            max_num_seqs=args.batch_size,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+        for prompt, limit in zip(prompts, limits):
+            engine.add_request(
+                prompt,
+                max_new_tokens=limit,
+                eos_token_ids=set(config.generation_eos_token_ids),
+                sampling_params=sampling_params,
+            )
+        return engine.run()
+
+    for _ in range(warmup):
+        run_static_workload()
+        run_continuous_workload()
+
+    static_results = []
+    continuous_results = []
+    for iteration in range(iterations):
+        # 交替先后顺序，降低温度、频率变化对某一模式的系统性偏置。
+        if iteration % 2 == 0:
+            static_results.append(run_static_workload())
+            continuous_results.append(run_continuous_workload())
+        else:
+            continuous_results.append(run_continuous_workload())
+            static_results.append(run_static_workload())
+
+    static_seconds = sum(result["seconds"] for result in static_results)
+    static_tokens = sum(result["tokens"] for result in static_results)
+    continuous_seconds = sum(
+        result.total_seconds for result in continuous_results
+    )
+    continuous_tokens = sum(
+        result.total_output_tokens for result in continuous_results
+    )
+    static_tps = static_tokens / static_seconds
+    continuous_tps = continuous_tokens / continuous_seconds
+    speedup = continuous_tps / static_tps
+
+    metrics = {
+        "backend": "continuous",
+        "max_num_seqs": args.batch_size,
+        "num_requests": args.num_requests,
+        "iterations": iterations,
+        "static_tokens_per_second": static_tps,
+        "continuous_tokens_per_second": continuous_tps,
+        "speedup": speedup,
+        "static_requests_per_second": (
+            args.num_requests * iterations / static_seconds
+        ),
+        "continuous_requests_per_second": (
+            args.num_requests * iterations / continuous_seconds
+        ),
+        "static_peak_memory_mib": max(
+            result["peak_memory_mib"] for result in static_results
+        ),
+        "continuous_peak_memory_mib": max(
+            result.peak_memory_mib for result in continuous_results
+        ),
+        "static_mean_request_latency_ms": statistics.fmean(
+            seconds * 1000
+            for result in static_results
+            for seconds in result["completion_seconds"]
+        ),
+        "continuous_mean_request_latency_ms": statistics.fmean(
+            seconds * 1000
+            for result in continuous_results
+            for seconds in result.request_finish_seconds
+        ),
+    }
+
+    print("Scheduler workload: static vs continuous")
+    print(f"  请求数         : {args.num_requests}")
+    print(f"  最大并发       : {args.batch_size}")
+    print(f"  生成上限       : {limits}")
+    print(f"  Static 吞吐    : {static_tps:.2f} tokens/s")
+    print(f"  Continuous 吞吐: {continuous_tps:.2f} tokens/s")
+    print(f"  吞吐倍率       : {speedup:.2f}x")
+    print(
+        "  平均请求延迟   : "
+        f"{metrics['static_mean_request_latency_ms']:.2f} ms static / "
+        f"{metrics['continuous_mean_request_latency_ms']:.2f} ms continuous"
+    )
+    print(
+        "  Static/Continuous 峰值显存: "
+        f"{metrics['static_peak_memory_mib']:.1f} / "
+        f"{metrics['continuous_peak_memory_mib']:.1f} MiB"
+    )
+
+    if args.save:
+        append_record(
+            args.save,
+            label=label,
+            metrics=metrics,
+            metadata={
+                "model": args.model,
+                "prompt": args.prompt,
+                "prompt_tokens": len(prompt_ids),
+                "request_max_new_tokens": limits,
+                "warmup": warmup,
+                "decoding": (
+                    "greedy" if sampling_params.is_greedy else "sampling"
+                ),
+            },
+        )
+        print(f"\n结果已追加到：{args.save}")
+
+
+def run_static_batch_benchmark(
+    args: argparse.Namespace,
+    tokenizer: Tokenizer,
+) -> None:
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size 必须大于 0")
+    warmup = 1 if args.warmup is None else args.warmup
+    iterations = 3 if args.iterations is None else args.iterations
+    label = args.label or f"stage-07-static-batch-{args.batch_size}"
+    config = ModelConfig.from_pretrained(args.model)
+    prompt_ids = tokenizer.encode_chat(
+        [{"role": "user", "content": args.prompt}],
+        enable_thinking=False,
+    )
+    prompts = [prompt_ids] * args.batch_size
+    loaded = load_model(config, device="cuda")
+
+    sampling_params = resolve_sampling_params(args, config)
+
+    def generate() -> BatchGenerationResult:
+        return generate_static_batch(
+            loaded.model,
+            prompts,
+            max_new_tokens=args.max_new_tokens,
+            eos_token_ids=set(config.generation_eos_token_ids),
+            pad_token_id=tokenizer.pad_token_id,
+            sampling_params=sampling_params,
+        )
+
+    for _ in range(warmup):
+        generate()
+    results = [generate() for _ in range(iterations)]
+    total_tokens = sum(result.total_output_tokens for result in results)
+    total_seconds = sum(sum(result.step_seconds) for result in results)
+    total_requests = args.batch_size * iterations
+    strategy = "greedy" if sampling_params.is_greedy else "sampling"
+    metrics = {
+        "backend": "static",
+        "batch_size": args.batch_size,
+        "iterations": iterations,
+        "mean_ttft_ms": statistics.fmean(result.ttft_ms for result in results),
+        "mean_tpot_ms": statistics.fmean(result.tpot_ms for result in results),
+        "output_tokens_per_second": total_tokens / total_seconds,
+        "requests_per_second": total_requests / total_seconds,
+        "peak_memory_mib": max(result.peak_memory_mib for result in results),
+        "model_load_seconds": loaded.load_seconds,
+    }
+
+    print(f"Static batch {strategy} generation")
+    print(f"  Batch size : {args.batch_size}")
+    print(f"  模型加载   : {metrics['model_load_seconds']:.2f} s")
+    print(f"  平均 TTFT  : {metrics['mean_ttft_ms']:.2f} ms")
+    print(f"  每轮 TPOT  : {metrics['mean_tpot_ms']:.2f} ms")
+    print(f"  总输出吞吐 : {metrics['output_tokens_per_second']:.2f} tokens/s")
+    print(f"  请求吞吐   : {metrics['requests_per_second']:.2f} requests/s")
+    print(f"  峰值显存   : {metrics['peak_memory_mib']:.1f} MiB")
+
+    if args.save:
+        append_record(
+            args.save,
+            label=label,
+            metrics=metrics,
+            metadata={
+                "model": args.model,
+                "prompt": args.prompt,
+                "prompt_tokens": len(prompt_ids),
+                "max_new_tokens": args.max_new_tokens,
+                "warmup": warmup,
+                "decoding": strategy,
+            },
+        )
+        print(f"\n结果已追加到：{args.save}")
 
 
 def run_generation_benchmark(
@@ -83,15 +369,6 @@ def run_generation_benchmark(
 ) -> None:
     warmup = 1 if args.warmup is None else args.warmup
     iterations = 3 if args.iterations is None else args.iterations
-    label = args.label or (
-        "stage-06-sampling"
-        if args.sample
-        else (
-            "stage-05-kv-cache"
-            if args.backend == "cached"
-            else "stage-04-naive"
-        )
-    )
     config = ModelConfig.from_pretrained(args.model)
     if args.prompt_repeat <= 0:
         raise ValueError("--prompt-repeat 必须大于 0")
@@ -99,23 +376,15 @@ def run_generation_benchmark(
     messages: list[ChatMessage] = [{"role": "user", "content": prompt_text}]
     prompt_token_ids = tokenizer.encode_chat(messages, enable_thinking=False)
     loaded = load_model(config, device="cuda")
-    sampling_params = SamplingParams(
-        temperature=(
-            config.generation_temperature
-            if args.sample and args.temperature is None
-            else (args.temperature or 0.0)
-        ),
-        top_k=(
-            config.generation_top_k
-            if args.sample and args.top_k is None
-            else (args.top_k or 0)
-        ),
-        top_p=(
-            config.generation_top_p
-            if args.sample and args.top_p is None
-            else (1.0 if args.top_p is None else args.top_p)
-        ),
-        seed=args.seed if args.sample else None,
+    sampling_params = resolve_sampling_params(args, config)
+    label = args.label or (
+        "stage-06-sampling"
+        if not sampling_params.is_greedy
+        else (
+            "stage-05-kv-cache"
+            if args.backend == "cached"
+            else "stage-04-naive"
+        )
     )
     generate_function = (
         generate_greedy_cached
