@@ -24,6 +24,9 @@ class PagedAttentionMetadata:
     key_cache: torch.Tensor
     value_cache: torch.Tensor
     block_tables: tuple[BlockTable, ...]
+    backend: str = "paged"
+    block_table_tensor: torch.Tensor | None = None
+    context_lengths: torch.Tensor | None = None
 
 
 class Qwen3Attention(nn.Module):
@@ -142,7 +145,19 @@ class Qwen3Attention(nn.Module):
             # 当前 token 的 K/V 一边参与本轮 Attention，一边作为 present 返回给 Engine，
             # 由 Engine 在模型前向结束后写入刚刚预留的物理槽位。
             present_key_value = (key, value)
-            attended = self._paged_decode(query, key, value, paged_attention)
+            if paged_attention.backend == "triton":
+                attended = self._triton_paged_decode(
+                    query,
+                    key,
+                    value,
+                    paged_attention,
+                )
+            elif paged_attention.backend == "paged":
+                attended = self._paged_decode(query, key, value, paged_attention)
+            else:
+                raise ValueError(
+                    f"未知 Paged Attention 后端：{paged_attention.backend}"
+                )
             attended = attended.transpose(1, 2).contiguous()
             attended = attended.view(batch_size, sequence_length, self.hidden_size)
             output = self.o_proj(attended)
@@ -336,6 +351,35 @@ class Qwen3Attention(nn.Module):
             batch_outputs.append(output.to(query.dtype).unsqueeze(1))
 
         return torch.stack(batch_outputs, dim=0)
+
+    def _triton_paged_decode(
+        self,
+        query: torch.Tensor,
+        current_key: torch.Tensor,
+        current_value: torch.Tensor,
+        metadata: PagedAttentionMetadata,
+    ) -> torch.Tensor:
+        """调用融合了 Block 扫描和在线 softmax 的 Triton Kernel。"""
+
+        if metadata.block_table_tensor is None:
+            raise ValueError("Triton 后端缺少 GPU BlockTable Tensor")
+        if metadata.context_lengths is None:
+            raise ValueError("Triton 后端缺少 Context Length Tensor")
+
+        # 延迟导入让 CPU 单测和未安装 Triton 的环境仍可使用普通后端。
+        from toyvllm.kernels.paged_attention import triton_paged_attention
+
+        return triton_paged_attention(
+            query,
+            current_key,
+            current_value,
+            metadata.key_cache,
+            metadata.value_cache,
+            metadata.block_table_tensor,
+            metadata.context_lengths,
+            layer_index=self.layer_index,
+            queries_per_kv=self.queries_per_kv,
+        )
 
     @staticmethod
     def _merge_kv_block(

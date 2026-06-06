@@ -213,6 +213,8 @@ class PagedKVCache:
     def attention_metadata(
         self,
         tables: tuple[BlockTable, ...],
+        *,
+        backend: str = "paged",
     ) -> PagedAttentionMetadata:
         """创建不复制 K/V 数据的 Paged Attention 只读视图。
 
@@ -224,10 +226,37 @@ class PagedKVCache:
         for table in tables:
             if table.block_size != self.shape.block_size:
                 raise ValueError("BlockTable 与物理池的 block_size 不一致")
+        if backend not in {"paged", "triton"}:
+            raise ValueError("Paged Attention backend 必须是 paged 或 triton")
+
+        block_table_tensor = None
+        context_lengths = None
+        if backend == "triton":
+            max_blocks = max(table.num_blocks for table in tables)
+            # -1 只用于补齐二维形状。Kernel 根据 context_lengths 屏蔽这些位置，
+            # 不会读取对应的物理地址。
+            rows = [
+                list(table.physical_block_ids)
+                + [-1] * (max_blocks - table.num_blocks)
+                for table in tables
+            ]
+            block_table_tensor = torch.tensor(
+                rows,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            context_lengths = torch.tensor(
+                [table.num_tokens for table in tables],
+                dtype=torch.int32,
+                device=self.device,
+            )
         return PagedAttentionMetadata(
             key_cache=self.key_cache,
             value_cache=self.value_cache,
             block_tables=tables,
+            backend=backend,
+            block_table_tensor=block_table_tensor,
+            context_lengths=context_lengths,
         )
 
     def write_prefill_batch(
