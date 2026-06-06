@@ -1883,10 +1883,169 @@ Scheduler BlockTable
     --save benchmarks/results.jsonl
 ```
 
+### 2026-06-06：第 10B 步，优化不能只盯着 Attention Kernel
+
+10A 把 Paged Attention 从大量 PyTorch 小算子融合为 Triton Kernel 后，继续优化前先
+检查整个 Decode 数据流，而不是默认瓶颈仍在 Attention 内部。
+
+#### 1. 第一次尝试：按 KV Head 合并 GQA Query
+
+10A 的 Grid 是：
+
+```text
+[batch, query_heads]
+```
+
+Qwen3 使用 GQA，多组 Query Head 会共享同一个 KV Head。直觉上的优化是改成：
+
+```text
+[batch, kv_heads]
+```
+
+一个 Triton Program 同时计算 `queries_per_kv` 个 Query Head。这样同一块 K/V 只加载
+一次，再广播给组内 Query。
+
+数学和输出都正确，但标准 Benchmark 结果是：
+
+```text
+逐 Query Head Kernel   84.72 tokens/s
+GQA 分组 Kernel        83.59 tokens/s
+倍率                   0.99x
+```
+
+它没有加速。原因是：
+
+- 当前上下文很短，K/V 带宽还不是主要瓶颈
+- 一个 Program 同时保存多组 Query、`m/l/acc`，寄存器压力更高
+- 三维广播与归约比 10A 的二维计算更复杂
+- 两种实现每层仍只发射一次 Grid，减少 Program 数不等于减少 Kernel launch 数
+
+所以默认 `triton` 保留更简单、更快的逐 Query Head Kernel，分组版仅作为
+`triton-grouped` 实验后端。这个负结果很重要：减少理论访存不保证真实 GPU 更快，
+必须结合占用率、寄存器和工作负载测量。
+
+#### 2. 真正瓶颈：Decode K/V 写回
+
+Attention 算完后，每层都会返回当前 token 的 Key/Value。旧实现按以下顺序写回：
+
+```text
+for request in batch:
+    for layer in 28 layers:
+        write key
+        write value
+```
+
+Batch 为 4 时，一轮 Decode 会产生大量细碎 Tensor 索引和赋值。即使每次写的数据很少，
+GPU Kernel 启动与 Python 调度成本仍然存在。
+
+独立微基准：
+
+```text
+Qwen3 层数       28
+Batch            4
+KV Heads         8
+Head Dim         128
+
+旧逐项写回       6.99 ms/轮
+向量化写回       0.48 ms/轮
+微基准倍率       14.6x
+```
+
+#### 3. 向量化写回的数据布局
+
+每一层返回：
+
+```text
+[batch, kv_heads, sequence, head_dim]
+```
+
+Decode 只需要最后一个 token。先去掉 sequence 维，再沿层维 stack：
+
+```text
+key_rows   [num_layers, batch, kv_heads, head_dim]
+value_rows [num_layers, batch, kv_heads, head_dim]
+```
+
+本轮每条请求的新槽位已经由 `reserve_many` 返回。把它们整理成：
+
+```text
+block_ids [batch]
+offsets   [batch]
+```
+
+物理池布局为：
+
+```text
+[num_layers, num_blocks, block_size, kv_heads, head_dim]
+```
+
+因此可以直接完成两次批量赋值：
+
+```python
+key_cache[:, block_ids, offsets] = key_rows
+value_cache[:, block_ids, offsets] = value_rows
+```
+
+Key 一次、Value 一次。层和请求不再由 Python 循环写入。
+
+#### 4. 为什么微基准 14.6 倍，整模型只有 1.11 倍
+
+标准工作负载最终结果：
+
+| 路径 | 总输出吞吐 | 峰值显存 |
+|---|---:|---:|
+| Gather + SDPA | 61.02 tokens/s | 4026.4 MiB |
+| PyTorch Paged Attention | 27.69 tokens/s | 4008.2 MiB |
+| Triton + 旧逐项写回 | 76.25 tokens/s | 4008.2 MiB |
+| Triton + 向量化写回 | 84.72 tokens/s | 4008.2 MiB |
+
+向量化写回让整体吞吐提升 `1.11x`。微基准只测写回，而整模型还包含：
+
+- Q/K/V 和输出线性层
+- MLP
+- RMSNorm 与 RoPE
+- Triton Paged Attention
+- LM Head 和采样
+- Scheduler 与 Python 控制流
+
+优化一个占总时间一部分的阶段，不可能让整条流水线也提高 14.6 倍。这就是
+Amdahl 定律在推理系统中的直接体现。
+
+#### 5. 为什么没有先优化 BlockTable 上传
+
+同样做了独立测量：
+
+```text
+每轮构造并上传 Triton BlockTable 元数据约 40 微秒
+```
+
+它确实可以通过常驻 GPU Workspace 继续降低，但相比旧写回的约 6.99 ms 小得多。因此
+本轮优先修复写回。优化顺序应该由测量决定，而不是由代码看起来是否“高级”决定。
+
+#### 6. 正确性与参考路径
+
+`write_decode_batch(..., vectorized=False)` 保留旧实现，专门用于 A/B Benchmark。
+默认使用向量化路径，并增加测试验证两种实现写出的整个物理池完全一致。
+
+本阶段验证：
+
+- PyTorch、逐 Query Triton、GQA 分组 Triton 输出一致
+- 不同请求长度和 BlockTable 补位正确
+- 旧写回与向量化写回物理池内容一致
+- 真实 Qwen3-1.7B 混合长度工作负载通过
+- 所有请求结束后 Block 全部回收
+
+下一步可以继续测量：
+
+- BlockTable GPU 常驻 Workspace
+- `num_warps` 和 Block Size autotune
+- 把 K/V 写回也改成专门 Triton Kernel，避免 `torch.stack` 临时 Tensor
+- 更长上下文下 GQA 分组和 Split-K 是否开始有收益
+
 ### 当前验证结果
 
 ```text
-52 个测试全部通过
+53 个测试全部通过
 Python compileall 通过
 CUDA、BF16、真实权重加载通过
 Tokenizer 普通文本往返和聊天模板测试通过
@@ -1902,6 +2061,7 @@ Paged Attention 在线 softmax 与连续 Attention 对齐
 Paged Decode 已验证不会调用 read_batch Gather
 Triton 与 PyTorch Paged Attention 在不同长度 Batch 上对齐
 真实 Qwen3-1.7B BF16 Triton 推理通过
+向量化 Decode K/V 写回与逐项参考实现对齐
 多种上下文长度的 benchmark 已写入 benchmarks/results.jsonl
 ```
 
@@ -1923,5 +2083,6 @@ Triton 与 PyTorch Paged Attention 在不同长度 Batch 上对齐
   - [x] 第 9C 步：Paged Attention 直接按 Block Table 读取
 - [ ] 第 10 步：性能测量与优化
   - [x] 第 10A 步：Triton 单 token Paged Attention
-  - [ ] 第 10B 步：BlockTable 常驻 GPU 与 Kernel 调优
+  - [x] 第 10B 步：GQA 实验与向量化 Decode K/V 写回
+  - [ ] 第 10C 步：BlockTable 常驻 GPU 与 Kernel autotune
 - [ ] 第 11 步：HTTP 服务（可选）

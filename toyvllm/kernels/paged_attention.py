@@ -160,6 +160,154 @@ if triton is not None:
             mask=dimension_mask,
         )
 
+    @triton.jit
+    def _grouped_paged_attention_decode_kernel(
+        query_ptr,
+        current_key_ptr,
+        current_value_ptr,
+        key_cache_ptr,
+        value_cache_ptr,
+        block_tables_ptr,
+        context_lengths_ptr,
+        output_ptr,
+        query_stride_batch: tl.constexpr,
+        query_stride_head: tl.constexpr,
+        key_stride_batch: tl.constexpr,
+        key_stride_head: tl.constexpr,
+        cache_stride_layer: tl.constexpr,
+        cache_stride_block: tl.constexpr,
+        cache_stride_token: tl.constexpr,
+        cache_stride_head: tl.constexpr,
+        table_stride_batch: tl.constexpr,
+        output_stride_batch: tl.constexpr,
+        output_stride_head: tl.constexpr,
+        layer_index,
+        QUERIES_PER_KV: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+        MAX_BLOCKS: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        """一个 Program 同时计算共享同一 KV Head 的一组 Query Head。
+
+        10A 为每个 Query Head 单独读取同一份 K/V。分组后 Grid 的第二维从
+        num_query_heads 变成 num_kv_heads，K/V Block 只加载一次，再广播给组内 Query。
+        """
+
+        batch_index = tl.program_id(0)
+        kv_head = tl.program_id(1)
+        group_offsets = tl.arange(0, QUERIES_PER_KV)
+        dimensions = tl.arange(0, BLOCK_D)
+        dimension_mask = dimensions < HEAD_DIM
+        first_query_head = kv_head * QUERIES_PER_KV
+
+        query_offsets = (
+            batch_index * query_stride_batch
+            + (first_query_head + group_offsets[:, None]) * query_stride_head
+            + dimensions[None, :]
+        )
+        query = tl.load(
+            query_ptr + query_offsets,
+            mask=dimension_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        current_offsets = (
+            batch_index * key_stride_batch
+            + kv_head * key_stride_head
+            + dimensions
+        )
+        current_key = tl.load(
+            current_key_ptr + current_offsets,
+            mask=dimension_mask,
+            other=0.0,
+        ).to(tl.float32)
+        current_value = tl.load(
+            current_value_ptr + current_offsets,
+            mask=dimension_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        scale = 1.0 / tl.sqrt(float(HEAD_DIM))
+        running_max = tl.sum(
+            query * current_key[None, :],
+            axis=1,
+        ) * scale
+        running_sum = tl.full(
+            (QUERIES_PER_KV,),
+            1.0,
+            tl.float32,
+        )
+        accumulator = tl.broadcast_to(
+            current_value[None, :],
+            (QUERIES_PER_KV, BLOCK_D),
+        )
+
+        token_offsets = tl.arange(0, BLOCK_SIZE)
+        context_length = tl.load(context_lengths_ptr + batch_index)
+        for logical_block in range(MAX_BLOCKS):
+            physical_block = tl.load(
+                block_tables_ptr
+                + batch_index * table_stride_batch
+                + logical_block
+            )
+            logical_token_indices = logical_block * BLOCK_SIZE + token_offsets
+            token_mask = logical_token_indices < context_length
+            cache_offsets = (
+                layer_index * cache_stride_layer
+                + physical_block * cache_stride_block
+                + token_offsets[:, None] * cache_stride_token
+                + kv_head * cache_stride_head
+                + dimensions[None, :]
+            )
+            matrix_mask = token_mask[:, None] & dimension_mask[None, :]
+            block_key = tl.load(
+                key_cache_ptr + cache_offsets,
+                mask=matrix_mask,
+                other=0.0,
+            ).to(tl.float32)
+
+            # [group, token, dim] 沿 dim 归约，得到组内每个 Query 对 Block 各 token 的分数。
+            scores = tl.sum(
+                query[:, None, :] * block_key[None, :, :],
+                axis=2,
+            ) * scale
+            scores = tl.where(token_mask[None, :], scores, float("-inf"))
+            block_max = tl.max(scores, axis=1)
+            new_max = tl.maximum(running_max, block_max)
+            old_scale = tl.exp(running_max - new_max)
+            weights = tl.exp(scores - new_max[:, None])
+            running_sum = (
+                running_sum * old_scale
+                + tl.sum(weights, axis=1)
+            )
+
+            block_value = tl.load(
+                value_cache_ptr + cache_offsets,
+                mask=matrix_mask,
+                other=0.0,
+            ).to(tl.float32)
+            accumulator = (
+                accumulator * old_scale[:, None]
+                + tl.sum(
+                    weights[:, :, None] * block_value[None, :, :],
+                    axis=1,
+                )
+            )
+            running_max = new_max
+
+        output = accumulator / running_sum[:, None]
+        output_offsets = (
+            batch_index * output_stride_batch
+            + (first_query_head + group_offsets[:, None]) * output_stride_head
+            + dimensions[None, :]
+        )
+        tl.store(
+            output_ptr + output_offsets,
+            output,
+            mask=dimension_mask[None, :],
+        )
+
 
 def triton_paged_attention(
     query: torch.Tensor,
@@ -172,6 +320,7 @@ def triton_paged_attention(
     *,
     layer_index: int,
     queries_per_kv: int,
+    grouped: bool = True,
 ) -> torch.Tensor:
     """启动 Triton Paged Attention。
 
@@ -204,8 +353,20 @@ def triton_paged_attention(
         raise ValueError("当前教学 Kernel 仅支持 head_dim <= 256")
 
     output = torch.empty_like(query)
-    grid = (batch_size, num_query_heads)
-    _paged_attention_decode_kernel[grid](
+    num_kv_heads = current_key.shape[1]
+    if num_query_heads != num_kv_heads * queries_per_kv:
+        raise ValueError("Query Head 与 KV Head 的 GQA 比例不一致")
+
+    kernel = (
+        _grouped_paged_attention_decode_kernel
+        if grouped
+        else _paged_attention_decode_kernel
+    )
+    grid = (
+        batch_size,
+        num_kv_heads if grouped else num_query_heads,
+    )
+    kernel[grid](
         query,
         current_key,
         current_value,
@@ -226,7 +387,11 @@ def triton_paged_attention(
         output.stride(0),
         output.stride(1),
         layer_index=layer_index,
-        queries_per_kv=queries_per_kv,
+        **(
+            {"QUERIES_PER_KV": queries_per_kv}
+            if grouped
+            else {"queries_per_kv": queries_per_kv}
+        ),
         HEAD_DIM=head_dim,
         BLOCK_SIZE=block_size,
         MAX_BLOCKS=max_blocks,

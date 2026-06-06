@@ -106,17 +106,22 @@ class PagedAttentionTest(unittest.TestCase):
             ),
             use_cache=True,
         )
-        actual, _ = attention(
-            hidden_states,
-            paged_attention=cache.attention_metadata(
-                tables,
-                backend="triton",
-            ),
-            use_cache=True,
-        )
-        torch.cuda.synchronize()
-
-        torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+        for backend in ("triton", "triton-grouped"):
+            actual, _ = attention(
+                hidden_states,
+                paged_attention=cache.attention_metadata(
+                    tables,
+                    backend=backend,
+                ),
+                use_cache=True,
+            )
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                actual,
+                expected,
+                atol=1e-4,
+                rtol=1e-4,
+            )
 
 
 if __name__ == "__main__":

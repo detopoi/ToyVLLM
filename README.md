@@ -145,3 +145,7 @@ Windows 环境安装本项目验证过的 Triton：
 - `--paged-attention gather`：9B Gather + SDPA 对照路径
 - `--paged-attention paged`：9C 纯 PyTorch 在线 softmax
 - `--paged-attention triton`：融合 Block 扫描和在线 softmax 的 Triton Kernel
+
+Decode 写回也已向量化：所有请求、全部层的新 token K/V 被整理为
+`[layers, batch, kv_heads, head_dim]`，Key/Value 各一次写入物理池，避免逐请求逐层
+发射大量小写 Kernel。

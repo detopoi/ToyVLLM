@@ -513,6 +513,7 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
         num_blocks: int,
         block_size: int = 16,
         attention_backend: str = "paged",
+        vectorized_decode_write: bool = True,
     ) -> None:
         super().__init__(
             model,
@@ -534,9 +535,16 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
             dtype=parameter.dtype,
             device=parameter.device,
         )
-        if attention_backend not in {"auto", "gather", "paged", "triton"}:
+        if attention_backend not in {
+            "auto",
+            "gather",
+            "paged",
+            "triton",
+            "triton-grouped",
+        }:
             raise ValueError(
-                "attention_backend 必须是 auto、gather、paged 或 triton"
+                "attention_backend 必须是 auto、gather、paged、triton "
+                "或 triton-grouped"
             )
         if attention_backend == "auto":
             from toyvllm.kernels.paged_attention import is_triton_available
@@ -547,6 +555,7 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
                 else "paged"
             )
         self.attention_backend = attention_backend
+        self.vectorized_decode_write = vectorized_decode_write
 
         # 父类的 _caches 属于连续 Tensor 后端。分页后端不使用它，
         # 保留空字典仅是为了维持父类初始化契约。
@@ -699,6 +708,7 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
         self.paged_cache.write_decode_batch(
             tuple(slots[sequence.request_id] for sequence in sequences),
             packed_present,
+            vectorized=self.vectorized_decode_write,
         )
         next_tokens = self._sample_rows(logits[:, -1], sequences)
         for index, sequence in enumerate(sequences):
@@ -761,6 +771,7 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
         self.paged_cache.write_decode_batch(
             tuple(slots[sequence.request_id] for sequence in sequences),
             packed_present,
+            vectorized=self.vectorized_decode_write,
         )
         next_tokens = self._sample_rows(logits[:, -1], sequences)
         for index, sequence in enumerate(sequences):
