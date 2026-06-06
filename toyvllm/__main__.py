@@ -132,7 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
     continuous_parser.add_argument("--block-size", type=int, default=16)
     continuous_parser.add_argument(
         "--paged-attention",
-        choices=("auto", "gather", "paged", "triton"),
+        choices=("auto", "gather", "paged", "triton", "triton-grouped"),
         default="auto",
         help="paged 后端的 Attention：9B gather、9C PyTorch 或 Triton Kernel",
     )

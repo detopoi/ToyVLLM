@@ -226,12 +226,15 @@ class PagedKVCache:
         for table in tables:
             if table.block_size != self.shape.block_size:
                 raise ValueError("BlockTable 与物理池的 block_size 不一致")
-        if backend not in {"paged", "triton"}:
-            raise ValueError("Paged Attention backend 必须是 paged 或 triton")
+        if backend not in {"paged", "triton", "triton-grouped"}:
+            raise ValueError(
+                "Paged Attention backend 必须是 paged、triton "
+                "或 triton-grouped"
+            )
 
         block_table_tensor = None
         context_lengths = None
-        if backend == "triton":
+        if backend in {"triton", "triton-grouped"}:
             max_blocks = max(table.num_blocks for table in tables)
             # -1 只用于补齐二维形状。Kernel 根据 context_lengths 屏蔽这些位置，
             # 不会读取对应的物理地址。
@@ -286,6 +289,8 @@ class PagedKVCache:
         self,
         slots_by_request: tuple[tuple[PhysicalTokenSlot, ...], ...],
         packed_present: list[KVCache],
+        *,
+        vectorized: bool = True,
     ) -> None:
         """只把本轮 Decode 新增的最后一个 K/V 写入物理池。
 
@@ -299,6 +304,15 @@ class PagedKVCache:
         if not packed_present or packed_present[0][0].shape[0] != batch_size:
             raise ValueError("packed_present 的 batch size 不一致")
 
+        if vectorized:
+            self._write_decode_batch_vectorized(
+                slots_by_request,
+                packed_present,
+            )
+            return
+
+        # 10A 及之前的参考写法：按请求拆分，再由 write() 按层写入。代码直观，但会产生
+        # batch_size * num_layers * 2 次小 Tensor 写操作，仅保留用于 benchmark 对照。
         for batch_index, slots in enumerate(slots_by_request):
             layer_values: list[KVCache] = []
             for key, value in packed_present:
@@ -309,6 +323,44 @@ class PagedKVCache:
                     )
                 )
             self.write(slots, layer_values)
+
+    def _write_decode_batch_vectorized(
+        self,
+        slots_by_request: tuple[tuple[PhysicalTokenSlot, ...], ...],
+        packed_present: list[KVCache],
+    ) -> None:
+        """把整批、全部层的新 K/V 合并为两次物理池写入。
+
+        每层模型返回 `[batch, kv_heads, sequence, head_dim]`。只取最后一个 token 后，
+        沿 layer 维 stack 成：
+
+            [num_layers, batch, kv_heads, head_dim]
+
+        物理池使用同样的 layer/batch/head/dim 顺序做高级索引，因此 Key 和 Value 各需
+        一次赋值，不再为每个请求、每一层单独发射小写 Kernel。
+        """
+
+        block_ids = torch.tensor(
+            [slots[0].physical_block_id for slots in slots_by_request],
+            dtype=torch.long,
+            device=self.device,
+        )
+        offsets = torch.tensor(
+            [slots[0].block_offset for slots in slots_by_request],
+            dtype=torch.long,
+            device=self.device,
+        )
+        key_rows = torch.stack(
+            [key[:, :, -1, :] for key, _ in packed_present],
+            dim=0,
+        ).to(device=self.device, dtype=self.dtype)
+        value_rows = torch.stack(
+            [value[:, :, -1, :] for _, value in packed_present],
+            dim=0,
+        ).to(device=self.device, dtype=self.dtype)
+
+        self.key_cache[:, block_ids, offsets] = key_rows
+        self.value_cache[:, block_ids, offsets] = value_rows
 
     def clear_blocks(self, block_ids: tuple[int, ...] | list[int]) -> None:
         """可选地清零释放块，便于测试或有数据隔离要求的场景。

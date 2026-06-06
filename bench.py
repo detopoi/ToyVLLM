@@ -140,7 +140,7 @@ def run_paged_benchmark(
         raise ValueError("--batch-size 和 --num-requests 必须大于 0")
     warmup = 1 if args.warmup is None else args.warmup
     iterations = 3 if args.iterations is None else args.iterations
-    label = args.label or "stage-10a-triton-paged-attention"
+    label = args.label or "stage-10b-vectorized-kv-write"
     config = ModelConfig.from_pretrained(args.model)
     prompt_ids = tokenizer.encode_chat(
         [{"role": "user", "content": args.prompt}],
@@ -154,7 +154,11 @@ def run_paged_benchmark(
     loaded = load_model(config, device="cuda")
     sampling_params = resolve_sampling_params(args, config)
 
-    def run_engine(attention_backend: str) -> ContinuousBatchResult:
+    def run_engine(
+        attention_backend: str,
+        *,
+        vectorized_decode_write: bool = True,
+    ) -> ContinuousBatchResult:
         engine = PagedContinuousBatchEngine(
             loaded.model,
             max_num_seqs=args.batch_size,
@@ -162,6 +166,7 @@ def run_paged_benchmark(
             num_blocks=args.num_kv_blocks,
             block_size=args.block_size,
             attention_backend=attention_backend,
+            vectorized_decode_write=vectorized_decode_write,
         )
         for prompt, limit in zip(prompts, limits):
             engine.add_request(
@@ -175,29 +180,52 @@ def run_paged_benchmark(
     for _ in range(warmup):
         run_engine("gather")
         run_engine("paged")
+        run_engine("triton-grouped")
+        run_engine("triton", vectorized_decode_write=False)
         run_engine("triton")
 
     gather_results = []
     paged_results = []
+    triton_grouped_results = []
+    triton_legacy_write_results = []
     triton_results = []
     for iteration in range(iterations):
         order = (
-            ("gather", "paged", "triton")
+            ("gather", "paged", "triton-grouped", "triton-legacy", "triton")
             if iteration % 2 == 0
-            else ("triton", "paged", "gather")
+            else (
+                "triton",
+                "triton-legacy",
+                "triton-grouped",
+                "paged",
+                "gather",
+            )
         )
         for backend in order:
-            result = run_engine(backend)
+            result = run_engine(
+                "triton" if backend == "triton-legacy" else backend,
+                vectorized_decode_write=backend != "triton-legacy",
+            )
             if backend == "gather":
                 gather_results.append(result)
             elif backend == "paged":
                 paged_results.append(result)
+            elif backend == "triton-grouped":
+                triton_grouped_results.append(result)
+            elif backend == "triton-legacy":
+                triton_legacy_write_results.append(result)
             else:
                 triton_results.append(result)
 
     gather_seconds = sum(result.total_seconds for result in gather_results)
     paged_seconds = sum(result.total_seconds for result in paged_results)
     triton_seconds = sum(result.total_seconds for result in triton_results)
+    triton_grouped_seconds = sum(
+        result.total_seconds for result in triton_grouped_results
+    )
+    triton_legacy_write_seconds = sum(
+        result.total_seconds for result in triton_legacy_write_results
+    )
     gather_tokens = sum(
         result.total_output_tokens for result in gather_results
     )
@@ -205,9 +233,20 @@ def run_paged_benchmark(
     triton_tokens = sum(
         result.total_output_tokens for result in triton_results
     )
+    triton_grouped_tokens = sum(
+        result.total_output_tokens for result in triton_grouped_results
+    )
+    triton_legacy_write_tokens = sum(
+        result.total_output_tokens
+        for result in triton_legacy_write_results
+    )
     gather_tps = gather_tokens / gather_seconds
     paged_tps = paged_tokens / paged_seconds
     triton_tps = triton_tokens / triton_seconds
+    triton_grouped_tps = triton_grouped_tokens / triton_grouped_seconds
+    triton_legacy_write_tps = (
+        triton_legacy_write_tokens / triton_legacy_write_seconds
+    )
     metrics = {
         "backend": "paged",
         "max_num_seqs": args.batch_size,
@@ -216,6 +255,10 @@ def run_paged_benchmark(
         "gather_tokens_per_second": gather_tps,
         "paged_tokens_per_second": paged_tps,
         "triton_tokens_per_second": triton_tps,
+        "triton_grouped_tokens_per_second": triton_grouped_tps,
+        "triton_legacy_write_tokens_per_second": triton_legacy_write_tps,
+        "grouped_speedup": triton_grouped_tps / triton_tps,
+        "vectorized_write_speedup": triton_tps / triton_legacy_write_tps,
         "speedup_vs_pytorch": triton_tps / paged_tps,
         "speedup_vs_gather": triton_tps / gather_tps,
         "gather_peak_memory_mib": max(
@@ -227,11 +270,18 @@ def run_paged_benchmark(
         "triton_peak_memory_mib": max(
             result.peak_memory_mib for result in triton_results
         ),
+        "triton_grouped_peak_memory_mib": max(
+            result.peak_memory_mib for result in triton_grouped_results
+        ),
+        "triton_legacy_write_peak_memory_mib": max(
+            result.peak_memory_mib
+            for result in triton_legacy_write_results
+        ),
         "num_kv_blocks": args.num_kv_blocks,
         "block_size": args.block_size,
     }
 
-    print("Paged Attention: Gather vs PyTorch vs Triton")
+    print("Paged Attention: Gather vs PyTorch vs Triton 10A/10B")
     print(f"  请求数/最大并发 : {args.num_requests}/{args.batch_size}")
     print(f"  生成上限       : {limits}")
     print(
@@ -240,7 +290,14 @@ def run_paged_benchmark(
     )
     print(f"  Paged 9B gather 吞吐: {gather_tps:.2f} tokens/s")
     print(f"  Paged 9C PyTorch 吞吐: {paged_tps:.2f} tokens/s")
-    print(f"  Paged Triton 吞吐    : {triton_tps:.2f} tokens/s")
+    print(f"  Triton GQA 分组吞吐  : {triton_grouped_tps:.2f} tokens/s")
+    print(f"  Triton 旧写回吞吐    : {triton_legacy_write_tps:.2f} tokens/s")
+    print(f"  Triton 10B 向量写回  : {triton_tps:.2f} tokens/s")
+    print(f"  GQA 分组/默认倍率    : {metrics['grouped_speedup']:.2f}x")
+    print(
+        "  向量/旧写回倍率      : "
+        f"{metrics['vectorized_write_speedup']:.2f}x"
+    )
     print(
         "  Triton/PyTorch 倍率  : "
         f"{metrics['speedup_vs_pytorch']:.2f}x"
@@ -250,9 +307,11 @@ def run_paged_benchmark(
         f"{metrics['speedup_vs_gather']:.2f}x"
     )
     print(
-        "  Gather/PyTorch/Triton 峰值显存: "
+        "  Gather/PyTorch/GQA/旧写回/10B 峰值显存: "
         f"{metrics['gather_peak_memory_mib']:.1f} / "
         f"{metrics['paged_peak_memory_mib']:.1f} / "
+        f"{metrics['triton_grouped_peak_memory_mib']:.1f} / "
+        f"{metrics['triton_legacy_write_peak_memory_mib']:.1f} / "
         f"{metrics['triton_peak_memory_mib']:.1f} MiB"
     )
 

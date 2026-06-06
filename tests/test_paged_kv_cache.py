@@ -152,6 +152,40 @@ class PagedKVCacheTest(unittest.TestCase):
         self.assertTrue(torch.all(restored_first[0][0][:, :, -1] == 500))
         self.assertTrue(torch.all(restored_second[1][1][:, :, -1] == 901))
 
+    def test_vectorized_decode_write_matches_reference_path(self) -> None:
+        first_table = self.manager.allocate(1, num_tokens=1)
+        second_table = self.manager.allocate(2, num_tokens=1)
+        slots = self.manager.reserve_many(((1, 1), (2, 1)))
+        present = []
+        for layer in range(2):
+            key = torch.arange(
+                layer * 24,
+                (layer + 1) * 24,
+                dtype=torch.float32,
+            ).view(2, 2, 2, 3)
+            value = key + 1000
+            present.append((key, value))
+
+        self.cache.key_cache.zero_()
+        self.cache.value_cache.zero_()
+        self.cache.write_decode_batch(
+            (slots[1], slots[2]),
+            present,
+            vectorized=False,
+        )
+        reference_key = self.cache.key_cache.clone()
+        reference_value = self.cache.value_cache.clone()
+        self.cache.key_cache.zero_()
+        self.cache.value_cache.zero_()
+
+        self.cache.write_decode_batch(
+            (slots[1], slots[2]),
+            present,
+            vectorized=True,
+        )
+        torch.testing.assert_close(self.cache.key_cache, reference_key)
+        torch.testing.assert_close(self.cache.value_cache, reference_value)
+
 
 if __name__ == "__main__":
     unittest.main()
