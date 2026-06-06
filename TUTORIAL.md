@@ -1065,10 +1065,269 @@ iterations   3
 下一阶段 Paged KV Cache 的目标，不只是“再加一个功能”，而是让每条请求通过 block table
 引用固定物理块。请求加入、增长和退出时只修改 block 映射，不再每轮搬动整段历史缓存。
 
+### 2026-06-06：第 9A 步，Paged KV Cache 内存管理层
+
+Paged Attention 是一个大工程，本项目拆成三段：
+
+```text
+9A  Block Manager + 物理 KV Block 池
+    先把分配、追加、回收和逻辑映射做正确
+
+9B  Engine 接入 Paged KV Cache
+    Prefill/Decode 把 K/V 写入物理块，请求结束回收块
+
+9C  Paged Attention
+    Attention 根据 Block Table 直接读取离散物理块
+    消除“先 gather 成连续 Cache 再调用 Attention”的中间复制
+```
+
+本次只完成 9A。现在已经具备分页存储，但模型 Attention 还没有走这条路径，因此本阶段不做
+端到端 tokens/s 对比，也不声称已经加速。
+
+#### 为什么连续 Tensor 不适合动态请求
+
+之前一条请求的每层 KV Cache 是：
+
+```text
+[1, num_kv_heads, sequence_length, head_dim]
+```
+
+请求每生成一个 token，就要把新 K/V 追加到 sequence 维。动态 batch 中不同请求长度不同，
+还需要每轮补齐、拼接和拆包。
+
+分页方案把显存预先切成等大的物理块。例如 `block_size=4`：
+
+```text
+物理 Block 0: 4 个 token 的 K/V 空间
+物理 Block 1: 4 个 token 的 K/V 空间
+物理 Block 2: 4 个 token 的 K/V 空间
+...
+```
+
+请求不再拥有一整段连续显存，只拥有一张 Block Table。
+
+#### 逻辑块与物理块
+
+假设一条请求有 10 个 token，block size 为 4，它需要三个逻辑块：
+
+```text
+逻辑块 0：token 0..3
+逻辑块 1：token 4..7
+逻辑块 2：token 8..9
+```
+
+物理块不要求连续。Block Table 可能是：
+
+```text
+logical block 0 -> physical block 5
+logical block 1 -> physical block 2
+logical block 2 -> physical block 11
+```
+
+那么 token 6 的地址计算为：
+
+```text
+logical_block = 6 // 4 = 1
+block_offset  = 6 % 4  = 2
+physical_block = block_table[1] = 2
+
+最终位置 = physical block 2 的 offset 2
+```
+
+这和操作系统虚拟内存的页表思想相似：程序看到连续的逻辑地址，底层物理页可以离散。
+
+#### BlockManager 管什么
+
+`block_manager.py` 只管理整数物理块号，不持有 K/V Tensor：
+
+```text
+free blocks   : 当前可分配的物理块编号
+block tables  : request_id -> 物理块编号列表
+num_tokens    : 请求当前有效 token 数
+```
+
+它负责：
+
+1. 注册请求。
+2. 根据 prompt 长度计算需要多少块。
+3. Decode 跨过块边界时追加一个块。
+4. 请求结束后回收全部块。
+5. 容量不足时抛出 `OutOfBlocksError`。
+
+分配公式：
+
+```text
+num_blocks = ceil(num_tokens / block_size)
+           = (num_tokens + block_size - 1) // block_size
+```
+
+例如 block size 为 4：
+
+```text
+0 token -> 0 block
+1 token -> 1 block
+4 token -> 1 block
+5 token -> 2 block
+```
+
+#### 原子分配
+
+请求从 4 token 增长到 9 token 时，可能一次需要新增两个块。如果空闲池只剩一个块，
+不能“先拿走一个再失败”，否则请求会处于半更新状态。
+
+当前 `reserve` 顺序是：
+
+```text
+1. 计算总共需要多少块
+2. 检查空闲块是否足够
+3. 完整取出所需块
+4. 一次性替换不可变 BlockTable
+```
+
+因此 Out Of Blocks 后：
+
+- 原 Block Table 不变
+- `num_tokens` 不变
+- 空闲队列不变
+
+Scheduler 下一阶段可以根据 `can_reserve` 决定等待、抢占或拒绝，而不会修复半分配请求。
+
+#### 物理 KV Block 池
+
+`kv_cache.py` 一次性预分配两个大 Tensor：
+
+```text
+key_cache:
+[num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+
+value_cache:
+[num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+```
+
+物理块号直接索引第二维。写入新 token 时，BlockManager 返回：
+
+```text
+(physical_block_id, block_offset)
+```
+
+PagedKVCache 把模型产生的：
+
+```text
+[1, num_kv_heads, num_new_tokens, head_dim]
+```
+
+转换为物理池需要的：
+
+```text
+[num_new_tokens, num_kv_heads, head_dim]
+```
+
+并写入对应槽位。
+
+当前 `read(BlockTable)` 可以按逻辑顺序把离散物理块 gather 回紧凑连续 Cache。这个接口主要
+用于测试和 9B 过渡接入。最终 9C Paged Attention 应直接按照 Block Table 读取物理池，
+不再先 gather 整段历史。
+
+#### Block 大小的取舍
+
+Block 太大：
+
+- Block Table 更短
+- 分配管理次数更少
+- 最后一个未填满 Block 的内部碎片更多
+
+Block 太小：
+
+- 内部碎片更少
+- Block Table 更长
+- 分配和地址映射次数更多
+- Paged Attention 需要跨更多块读取
+
+Qwen3-1.7B 的 BF16 KV Cache 每 token 为 112 KiB。使用 16-token Block：
+
+```text
+一个物理 Block = 112 KiB * 16 = 1792 KiB = 1.75 MiB
+```
+
+如果提供 1 GiB KV Cache 预算：
+
+```text
+大约 585 个 Block
+全体请求合计约 585 * 16 = 9360 个 token
+```
+
+这 9360 token 可以属于一条长请求，也可以动态分给许多短请求，不需要按每条请求的最大长度
+提前预留。
+
+#### 物理 Block 与 CUDA Shared Memory 不是一回事
+
+这两个概念名字中都有“块/共享”，但层级完全不同：
+
+```text
+Paged KV Physical Block
+  位置：GPU global memory（显存）
+  大小：当前模型 16 token 约 1.75 MiB
+  生命周期：跨很多次 Prefill/Decode kernel
+  用途：持久保存历史 token 的 K/V
+
+CUDA Thread Block Shared Memory
+  位置：SM 上的片上共享内存
+  大小：通常是几十到几百 KiB 级别
+  生命周期：一次 kernel 执行
+  用途：线程协作、复用当前计算 tile、减少 global memory 访问
+```
+
+Paged Attention kernel 未来可能把一小片 K/V 从 global memory 搬到寄存器或 shared memory
+参与点积，但不可能把完整请求的 KV Cache 长期放在 shared memory 中。
+
+#### 当前不做活跃请求间共享
+
+当前不实现两条 RUNNING 请求同时引用同一个物理块。`free` 后的块可以被后续请求复用，
+但活跃块只有一个所有者，因此不需要引用计数。
+
+Prefix Cache 会让相同前缀的请求共享只读 Block，并在修改时使用 Copy-on-Write。这需要：
+
+- Block 引用计数
+- 前缀哈希
+- 只读共享规则
+- Copy-on-Write
+- 淘汰策略
+
+它属于 Paged KV Cache 之上的独立优化，不在第一版 Block Manager 中提前混入。
+
+#### 本阶段验证
+
+新增测试覆盖：
+
+- Prompt 初始分配
+- Decode 跨 Block 边界追加
+- 释放后物理 Block 被其他请求复用
+- 非连续物理 Block 组成连续逻辑序列
+- Out Of Blocks 时状态完全不变
+- `can_reserve` 不修改状态
+- 多层 K/V 写入后按 Block Table 完整还原
+- 清零释放块
+- K/V 形状检查
+- Block 显存大小计算
+
+测试还发现一个 PyTorch 高级索引细节：
+
+```python
+tensor[:, ids].zero_()
+```
+
+LongTensor 高级索引返回副本，`zero_()` 不会清零原物理池。最终使用：
+
+```python
+tensor.index_fill_(dim=1, index=ids, value=0)
+```
+
+在原 Tensor 上完成写回。
+
 ### 当前验证结果
 
 ```text
-34 个测试全部通过
+43 个测试全部通过
 Python compileall 通过
 CUDA、BF16、真实权重加载通过
 Tokenizer 普通文本往返和聊天模板测试通过
@@ -1078,6 +1337,7 @@ Naive 与 cached 生成结果一致
 Greedy 与 sampling 均可运行，采样结果可复现
 不同长度静态 batch 与逐请求结果一致
 Scheduler 状态转换、FIFO、在线 arrival 和动态 admission 通过
+Paged Block 分配、回收、离散映射和 K/V 读写通过
 多种上下文长度的 benchmark 已写入 benchmarks/results.jsonl
 ```
 
@@ -1094,5 +1354,8 @@ Scheduler 状态转换、FIFO、在线 arrival 和动态 admission 通过
 - [x] 第 7 步：静态批处理
 - [x] 第 8 步：连续批处理与调度器
 - [ ] 第 9 步：Paged KV Cache
+  - [x] 第 9A 步：Block Manager 与物理 KV Block 池
+  - [ ] 第 9B 步：Engine 接入分页缓存
+  - [ ] 第 9C 步：Paged Attention 直接按 Block Table 读取
 - [ ] 第 10 步：性能测量与优化
 - [ ] 第 11 步：HTTP 服务（可选）

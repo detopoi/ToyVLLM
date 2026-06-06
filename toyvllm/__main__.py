@@ -141,6 +141,7 @@ def main() -> None:
         print(report.format())
         print(f"KV Cache/token : {config.kv_cache_bytes_per_token / 1024:.1f} KiB")
         print(f"KV Cache/1024  : {config.kv_cache_mib(1024):.1f} MiB")
+        print(f"KV Block/16    : {config.kv_cache_block_mib(16):.2f} MiB")
         return
 
     if args.command == "tokenize":

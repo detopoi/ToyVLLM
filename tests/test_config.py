@@ -21,6 +21,7 @@ class ModelConfigTest(unittest.TestCase):
     def test_kv_cache_size(self) -> None:
         self.assertEqual(self.config.kv_cache_bytes_per_token, 114688)
         self.assertEqual(self.config.kv_cache_mib(4096), 448.0)
+        self.assertEqual(self.config.kv_cache_block_mib(16), 1.75)
 
 
 if __name__ == "__main__":
