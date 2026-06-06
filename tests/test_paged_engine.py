@@ -71,6 +71,57 @@ class PagedContinuousBatchEngineTest(unittest.TestCase):
         self.assertEqual(result.sequences[1].admitted_step, 1)
         self.assertEqual(engine.block_manager.stats.num_used_blocks, 0)
 
+    def test_paged_attention_does_not_call_batch_gather(self) -> None:
+        torch.manual_seed(0)
+        model = Qwen3ForCausalLM(tiny_config()).eval()
+        engine = PagedContinuousBatchEngine(
+            model,
+            max_num_seqs=2,
+            pad_token_id=0,
+            num_blocks=8,
+            block_size=2,
+        )
+
+        def fail_if_called(*args: object, **kwargs: object) -> None:
+            raise AssertionError("9C Decode 不应调用 read_batch")
+
+        engine.paged_cache.read_batch = fail_if_called
+        engine.add_request(
+            [1, 2, 3],
+            max_new_tokens=3,
+            eos_token_ids=set(),
+        )
+        result = engine.run()
+        self.assertEqual(len(result.sequences[0].output_token_ids), 3)
+
+    def test_gather_and_paged_attention_generate_same_tokens(self) -> None:
+        torch.manual_seed(0)
+        model = Qwen3ForCausalLM(tiny_config()).eval()
+        outputs = []
+        for backend in ("gather", "paged"):
+            engine = PagedContinuousBatchEngine(
+                model,
+                max_num_seqs=2,
+                pad_token_id=0,
+                num_blocks=8,
+                block_size=2,
+                attention_backend=backend,
+            )
+            for prompt in ([1, 2, 3], [4, 5]):
+                engine.add_request(
+                    list(prompt),
+                    max_new_tokens=4,
+                    eos_token_ids=set(),
+                )
+            outputs.append(
+                [
+                    sequence.output_token_ids
+                    for sequence in engine.run().sequences
+                ]
+            )
+
+        self.assertEqual(outputs[0], outputs[1])
+
 
 if __name__ == "__main__":
     unittest.main()

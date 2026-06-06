@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 
 from toyvllm.block_manager import BlockTable, PhysicalTokenSlot
-from toyvllm.layers.attention import KVCache
+from toyvllm.layers.attention import KVCache, PagedAttentionMetadata
 
 
 @dataclass(frozen=True)
@@ -209,6 +209,26 @@ class PagedKVCache:
                 values.append(value)
             packed.append((torch.cat(keys, dim=0), torch.cat(values, dim=0)))
         return packed, attention_mask
+
+    def attention_metadata(
+        self,
+        tables: tuple[BlockTable, ...],
+    ) -> PagedAttentionMetadata:
+        """创建不复制 K/V 数据的 Paged Attention 只读视图。
+
+        Tensor 只是引用同一份物理池；真正随请求变化的只有很小的 BlockTable 元组。
+        """
+
+        if not tables:
+            raise ValueError("tables 不能为空")
+        for table in tables:
+            if table.block_size != self.shape.block_size:
+                raise ValueError("BlockTable 与物理池的 block_size 不一致")
+        return PagedAttentionMetadata(
+            key_cache=self.key_cache,
+            value_cache=self.value_cache,
+            block_tables=tables,
+        )
 
     def write_prefill_batch(
         self,

@@ -493,14 +493,15 @@ class ContinuousBatchEngine:
 class PagedContinuousBatchEngine(ContinuousBatchEngine):
     """使用 BlockManager 和共享物理 KV Block 池的连续批处理引擎。
 
-    这是 9B 过渡实现：
+    这是 9C 教学实现：
 
     - 请求长期状态已经存放在分页物理池；
     - Prefill 和 Decode 只写本轮新增的 K/V；
     - 请求结束后按 Block Table 回收物理块；
-    - Attention 前仍通过 read_batch gather 成连续历史 Cache。
+    - Decode Attention 按 Block Table 直接扫描物理块；
+    - 不再通过 read_batch gather 连续历史 Cache。
 
-    最后一项 gather 要到 9C Paged Attention 才能消除。
+    当前使用纯 PyTorch 在线 softmax 来解释算法，尚未融合成 Triton/CUDA Kernel。
     """
 
     def __init__(
@@ -511,6 +512,7 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
         pad_token_id: int,
         num_blocks: int,
         block_size: int = 16,
+        attention_backend: str = "paged",
     ) -> None:
         super().__init__(
             model,
@@ -532,6 +534,9 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
             dtype=parameter.dtype,
             device=parameter.device,
         )
+        if attention_backend not in {"gather", "paged"}:
+            raise ValueError("attention_backend 必须是 gather 或 paged")
+        self.attention_backend = attention_backend
 
         # 父类的 _caches 属于连续 Tensor 后端。分页后端不使用它，
         # 保留空字典仅是为了维持父类初始化契约。
@@ -641,19 +646,77 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
     ) -> float:
         if not sequences:
             return 0.0
+        if self.attention_backend == "gather":
+            return self._execute_decode_gather(sequences, step=step)
+
+        history_tables = tuple(
+            self.block_manager.get_block_table(sequence.request_id)
+            for sequence in sequences
+        )
+        paged_attention = self.paged_cache.attention_metadata(history_tables)
+
+        # 先原子预留写入槽位，避免模型算完后才发现容量不足。Attention 持有的是 reserve
+        # 之前的不可变 BlockTable 快照，因此不会错误读取尚未写入的新槽位。
+        slots = self.block_manager.reserve_many(
+            tuple((sequence.request_id, 1) for sequence in sequences)
+        )
+
+        input_ids = torch.tensor(
+            [[sequence.last_token_id] for sequence in sequences],
+            dtype=torch.long,
+            device=self.device,
+        )
+        position_ids = torch.tensor(
+            [[table.num_tokens] for table in history_tables],
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        started = self._start_timing()
+        logits, packed_present = self.model(
+            input_ids,
+            last_token_only=True,
+            position_ids=position_ids,
+            paged_attention=paged_attention,
+            use_cache=True,
+        )
+        self._stop_timing()
+        elapsed = time.perf_counter() - started
+
+        self.paged_cache.write_decode_batch(
+            tuple(slots[sequence.request_id] for sequence in sequences),
+            packed_present,
+        )
+        next_tokens = self._sample_rows(logits[:, -1], sequences)
+        for index, sequence in enumerate(sequences):
+            finish_reason = self.scheduler.append_token(
+                sequence,
+                int(next_tokens[index].item()),
+                step=step,
+            )
+            if finish_reason is not None:
+                self._finish_seconds[sequence.request_id] = (
+                    time.perf_counter() - self._run_started
+                )
+                self._release(sequence.request_id)
+        return elapsed
+
+    def _execute_decode_gather(
+        self,
+        sequences: tuple[Sequence, ...],
+        *,
+        step: int,
+    ) -> float:
+        """保留 9B 的 Gather 路径，仅用于和 9C 做可重复的 A/B Benchmark。"""
 
         old_tables = tuple(
             self.block_manager.get_block_table(sequence.request_id)
             for sequence in sequences
         )
         packed_cache, attention_mask = self.paged_cache.read_batch(old_tables)
-
-        # read_batch 必须发生在 reserve_many 之前。reserve 会把 num_tokens 加一，
-        # 新槽位此时尚未写入，若先 reserve 再 read 就会 gather 未初始化数据。
         slots = self.block_manager.reserve_many(
             tuple((sequence.request_id, 1) for sequence in sequences)
         )
-
         input_ids = torch.tensor(
             [[sequence.last_token_id] for sequence in sequences],
             dtype=torch.long,

@@ -134,13 +134,13 @@ def run_paged_benchmark(
     args: argparse.Namespace,
     tokenizer: Tokenizer,
 ) -> None:
-    """同一 Scheduler 工作负载下比较连续请求 Cache 与分页物理池。"""
+    """同一分页存储和 Scheduler 下比较 Gather 与在线 Paged Attention。"""
 
     if args.batch_size <= 0 or args.num_requests <= 0:
         raise ValueError("--batch-size 和 --num-requests 必须大于 0")
     warmup = 1 if args.warmup is None else args.warmup
     iterations = 3 if args.iterations is None else args.iterations
-    label = args.label or "stage-09b-paged-engine"
+    label = args.label or "stage-09c-paged-attention-reference"
     config = ModelConfig.from_pretrained(args.model)
     prompt_ids = tokenizer.encode_chat(
         [{"role": "user", "content": args.prompt}],
@@ -154,21 +154,15 @@ def run_paged_benchmark(
     loaded = load_model(config, device="cuda")
     sampling_params = resolve_sampling_params(args, config)
 
-    def run_engine(paged: bool) -> ContinuousBatchResult:
-        if paged:
-            engine = PagedContinuousBatchEngine(
-                loaded.model,
-                max_num_seqs=args.batch_size,
-                pad_token_id=tokenizer.pad_token_id,
-                num_blocks=args.num_kv_blocks,
-                block_size=args.block_size,
-            )
-        else:
-            engine = ContinuousBatchEngine(
-                loaded.model,
-                max_num_seqs=args.batch_size,
-                pad_token_id=tokenizer.pad_token_id,
-            )
+    def run_engine(attention_backend: str) -> ContinuousBatchResult:
+        engine = PagedContinuousBatchEngine(
+            loaded.model,
+            max_num_seqs=args.batch_size,
+            pad_token_id=tokenizer.pad_token_id,
+            num_blocks=args.num_kv_blocks,
+            block_size=args.block_size,
+            attention_backend=attention_backend,
+        )
         for prompt, limit in zip(prompts, limits):
             engine.add_request(
                 prompt,
@@ -179,39 +173,37 @@ def run_paged_benchmark(
         return engine.run()
 
     for _ in range(warmup):
-        run_engine(False)
-        run_engine(True)
+        run_engine("gather")
+        run_engine("paged")
 
-    continuous_results = []
+    gather_results = []
     paged_results = []
     for iteration in range(iterations):
         if iteration % 2 == 0:
-            continuous_results.append(run_engine(False))
-            paged_results.append(run_engine(True))
+            gather_results.append(run_engine("gather"))
+            paged_results.append(run_engine("paged"))
         else:
-            paged_results.append(run_engine(True))
-            continuous_results.append(run_engine(False))
+            paged_results.append(run_engine("paged"))
+            gather_results.append(run_engine("gather"))
 
-    continuous_seconds = sum(
-        result.total_seconds for result in continuous_results
-    )
+    gather_seconds = sum(result.total_seconds for result in gather_results)
     paged_seconds = sum(result.total_seconds for result in paged_results)
-    continuous_tokens = sum(
-        result.total_output_tokens for result in continuous_results
+    gather_tokens = sum(
+        result.total_output_tokens for result in gather_results
     )
     paged_tokens = sum(result.total_output_tokens for result in paged_results)
-    continuous_tps = continuous_tokens / continuous_seconds
+    gather_tps = gather_tokens / gather_seconds
     paged_tps = paged_tokens / paged_seconds
     metrics = {
         "backend": "paged",
         "max_num_seqs": args.batch_size,
         "num_requests": args.num_requests,
         "iterations": iterations,
-        "continuous_tokens_per_second": continuous_tps,
+        "gather_tokens_per_second": gather_tps,
         "paged_tokens_per_second": paged_tps,
-        "speedup": paged_tps / continuous_tps,
-        "continuous_peak_memory_mib": max(
-            result.peak_memory_mib for result in continuous_results
+        "speedup": paged_tps / gather_tps,
+        "gather_peak_memory_mib": max(
+            result.peak_memory_mib for result in gather_results
         ),
         "paged_peak_memory_mib": max(
             result.peak_memory_mib for result in paged_results
@@ -220,19 +212,19 @@ def run_paged_benchmark(
         "block_size": args.block_size,
     }
 
-    print("Paged Engine 9B: continuous cache vs physical block pool")
+    print("Paged Attention: 9B gather vs 9C online softmax")
     print(f"  请求数/最大并发 : {args.num_requests}/{args.batch_size}")
     print(f"  生成上限       : {limits}")
     print(
         f"  KV Blocks      : {args.num_kv_blocks} × "
         f"{args.block_size} tokens"
     )
-    print(f"  Continuous 吞吐: {continuous_tps:.2f} tokens/s")
-    print(f"  Paged 9B 吞吐  : {paged_tps:.2f} tokens/s")
+    print(f"  Paged 9B gather 吞吐: {gather_tps:.2f} tokens/s")
+    print(f"  Paged 9C online 吞吐: {paged_tps:.2f} tokens/s")
     print(f"  吞吐倍率       : {metrics['speedup']:.2f}x")
     print(
-        "  Continuous/Paged 峰值显存: "
-        f"{metrics['continuous_peak_memory_mib']:.1f} / "
+        "  Gather/Online 峰值显存: "
+        f"{metrics['gather_peak_memory_mib']:.1f} / "
         f"{metrics['paged_peak_memory_mib']:.1f} MiB"
     )
 

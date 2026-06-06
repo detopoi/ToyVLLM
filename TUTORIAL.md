@@ -1526,10 +1526,190 @@ token，因此抵消了一部分物理池 gather 成本。
 - 非连续物理块可组成正确 Attention 历史
 - 所有请求结束后物理块全部回收
 
+### 2026-06-06：第 9C 步，Paged Attention 直接读取物理块
+
+9B 已经把 KV 长期存储变成分页物理池，但每轮 Decode 前仍调用 `read_batch()`：
+
+```text
+离散物理块 -> Gather -> 左 Padding 连续 Tensor -> SDPA
+```
+
+这会产生一份临时历史 Cache，长度不同的请求还要补齐到 Batch 最大长度。9C 把 Decode
+数据流改为：
+
+```text
+Query + BlockTable + 物理 KV Block 池
+              |
+              v
+逐 Block 在线 softmax
+              |
+              v
+Attention Output
+```
+
+#### 1. 新增 Paged Attention 元数据
+
+`PagedAttentionMetadata` 只保存三类引用：
+
+- 整个 Key 物理池
+- 整个 Value 物理池
+- 当前 Decode Batch 每条请求的 BlockTable
+
+它不复制 K/V。Attention 根据自己的 `layer_index` 读取物理池当前层，再按照
+`physical_block_ids` 的逻辑顺序扫描 Block。物理编号即使是 `[7, 2, 19]`，逻辑序列
+仍然是第 0、1、2 块。
+
+#### 2. 为什么不能对每个 Block 单独做普通 softmax
+
+假设完整历史被分成 A、B 两块。分别计算：
+
+```text
+softmax(scores_A)
+softmax(scores_B)
+```
+
+再把两个输出相加是错误的，因为两块使用了不同分母。完整 Attention 需要所有 token
+共同参与同一次归一化。
+
+9C 为每个 Query Head 维护三个在线状态：
+
+```text
+m   = 已扫描 score 的最大值
+l   = sum(exp(score - m))
+acc = sum(exp(score - m) * value)
+```
+
+读到新 Block 后，先计算该块最大值 `block_max`，再更新：
+
+```text
+new_m   = max(m, block_max)
+old_mul = exp(m - new_m)
+weight  = exp(block_score - new_m)
+
+new_l   = l * old_mul + sum(weight)
+new_acc = acc * old_mul + sum(weight * block_value)
+```
+
+全部 Block 和当前 token 扫描结束后：
+
+```text
+attention_output = acc / l
+```
+
+`old_mul` 会把旧状态换算到新的最大值基准，因此结果与一次性对完整 scores 做 softmax
+数学等价，同时保持数值稳定。中间 K/V 和 scores 的大小只与 `block_size` 有关，不再
+与完整上下文长度成正比。
+
+#### 3. 当前 token 为什么不先写入物理池
+
+Decode 的当前 token 也必须看到自己的 Key/Value，但模型的每一层要先计算出该层 K/V，
+Engine 才能在整次前向结束后统一写回。因此本轮顺序是：
+
+```text
+1. 保存 reserve 前的旧 BlockTable 快照
+2. 原子 reserve_many，为本轮新 token 保证物理槽位
+3. Attention 扫描旧 BlockTable
+4. 把当前层刚算出的 K/V 当作最后一个长度为 1 的临时块
+5. 模型前向结束后，把各层当前 K/V 写入预留槽位
+```
+
+`BlockTable` 是不可变 dataclass。即使 BlockManager 在第 2 步生成了包含新 token 的表，
+Attention 持有的旧快照仍只描述已经初始化的历史，因此不会读取未写入显存。
+
+#### 4. RoPE 位置如何确定
+
+9B 的连续 Cache 可以从 Tensor 长度推断当前位置。9C 不再传 `past_key_values`，所以
+Engine 显式构造：
+
+```text
+position_id = old_block_table.num_tokens
+```
+
+每条请求拥有自己的位置，不受 Batch 中最长请求和 Padding 影响。
+
+#### 5. GQA 为什么不需要复制 KV Head
+
+Qwen3-1.7B 的 Query Head 多于 KV Head。旧 SDPA 路径通过 `repeat_interleave` 临时复制
+K/V Head。分页实现把 Query reshape 为：
+
+```text
+[num_kv_heads, queries_per_kv, head_dim]
+```
+
+同一个 KV Head 直接服务它对应的一组 Query Head，避免在每个 Block 上真的复制 K/V。
+
+#### 6. 为什么 9C 参考版反而更慢
+
+标准混合长短请求 Benchmark：
+
+```text
+请求数       8
+最大并发     4
+Prompt       18 token
+生成上限     [4, 16, 4, 16, 4, 16, 4, 16]
+Block Pool   64 blocks
+Block Size   16 tokens
+```
+
+结果：
+
+| Attention 路径 | 总输出吞吐 | 峰值显存 |
+|---|---:|---:|
+| 9B Gather + SDPA | 56.93 tokens/s | 4026.0 MiB |
+| 9C PyTorch 在线 softmax | 27.60 tokens/s | 4008.2 MiB |
+
+9C 吞吐只有 9B 的 `0.48x`，但峰值显存降低约 17.8 MiB。原因是当前参考实现包含：
+
+- Python 层的请求循环
+- Python 层的物理 Block 循环
+- 每个 Block 多次 `einsum`、`exp`、`sum` GPU kernel 启动
+- Attention 各步骤之间没有 Kernel Fusion
+
+9B 虽然做了 Gather，但随后能进入 PyTorch 已高度优化的 fused SDPA。GPU 更擅长少量大
+Kernel，而不是大量由 Python 发射的小 Kernel。
+
+因此 9C 的完成标准不是“纯 PyTorch 马上加速”，而是：
+
+- Attention 已真正消费 BlockTable
+- Decode 不再调用 `read_batch`
+- 不再创建带 Padding 的完整历史 KV Batch
+- 在线 softmax 与连续 Attention 数学对齐
+- Engine 的预留、写回、释放生命周期保持正确
+
+下一阶段性能优化要把“请求循环 + Block 循环 + 在线 softmax”融合进一个 Triton/CUDA
+Kernel。届时 GPU Thread Block 可协作加载一小块 K/V，使用寄存器或 shared memory
+归约 `m/l/acc`，这才是生产级 Paged Attention 的性能来源。
+
+#### 7. 如何运行和对比
+
+默认 9C：
+
+```powershell
+& $PYTHON -m toyvllm continuous --cache-backend paged `
+    --paged-attention paged --num-kv-blocks 64 --block-size 16 `
+    --max-num-seqs 4 "你好" "解释 KV Cache"
+```
+
+保留的 9B A/B 对照：
+
+```powershell
+& $PYTHON -m toyvllm continuous --cache-backend paged `
+    --paged-attention gather --num-kv-blocks 64 --block-size 16 `
+    --max-num-seqs 4 "你好" "解释 KV Cache"
+```
+
+Benchmark：
+
+```powershell
+& $PYTHON bench.py --backend paged --batch-size 4 --num-requests 8 `
+    --short-new-tokens 4 --max-new-tokens 16 --warmup 1 --iterations 3 `
+    --save benchmarks/results.jsonl
+```
+
 ### 当前验证结果
 
 ```text
-48 个测试全部通过
+51 个测试全部通过
 Python compileall 通过
 CUDA、BF16、真实权重加载通过
 Tokenizer 普通文本往返和聊天模板测试通过
@@ -1541,6 +1721,8 @@ Greedy 与 sampling 均可运行，采样结果可复现
 Scheduler 状态转换、FIFO、在线 arrival 和动态 admission 通过
 Paged Block 分配、回收、离散映射和 K/V 读写通过
 Paged Engine Prefill、Decode、Admission 与完整 Block 回收通过
+Paged Attention 在线 softmax 与连续 Attention 对齐
+Paged Decode 已验证不会调用 read_batch Gather
 多种上下文长度的 benchmark 已写入 benchmarks/results.jsonl
 ```
 
@@ -1556,9 +1738,9 @@ Paged Engine Prefill、Decode、Admission 与完整 Block 回收通过
 - [x] 第 6 步：采样策略
 - [x] 第 7 步：静态批处理
 - [x] 第 8 步：连续批处理与调度器
-- [ ] 第 9 步：Paged KV Cache
+- [x] 第 9 步：Paged KV Cache
   - [x] 第 9A 步：Block Manager 与物理 KV Block 池
   - [x] 第 9B 步：Engine 接入分页缓存
-  - [ ] 第 9C 步：Paged Attention 直接按 Block Table 读取
+  - [x] 第 9C 步：Paged Attention 直接按 Block Table 读取
 - [ ] 第 10 步：性能测量与优化
 - [ ] 第 11 步：HTTP 服务（可选）
