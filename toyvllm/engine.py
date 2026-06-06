@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+"""连续批处理执行器。
+
+Scheduler 决定本轮运行谁；本模块负责把这些 Sequence 转成模型需要的规则 Tensor，
+执行 Prefill/Decode，并管理每条请求对应的 GPU KV Cache。
+"""
+
 import time
 from dataclasses import dataclass
 
@@ -14,6 +20,8 @@ from toyvllm.sequence import Sequence
 
 @dataclass(frozen=True)
 class EngineIteration:
+    """一轮调度轨迹，区分旧请求 Decode 与新请求 Prefill。"""
+
     step: int
     decode_request_ids: tuple[int, ...]
     prefill_request_ids: tuple[int, ...]
@@ -23,6 +31,8 @@ class EngineIteration:
 
 @dataclass(frozen=True)
 class ContinuousBatchResult:
+    """一次请求流执行完成后的结果和性能信息。"""
+
     sequences: tuple[Sequence, ...]
     completion_order: tuple[int, ...]
     iterations: tuple[EngineIteration, ...]
@@ -44,7 +54,18 @@ class ContinuousBatchResult:
 
 
 class ContinuousBatchEngine:
-    """动态重组 batch 的教学版连续批处理引擎。"""
+    """动态重组 batch 的教学版连续批处理引擎。
+
+    核心循环不是“一批请求从头跑到尾”，而是：
+
+    1. 让当前 RUNNING 请求各生成一个 token；
+    2. 回收本轮完成请求的槽位和 KV Cache；
+    3. 从 WAITING 队列接纳新请求；
+    4. 对新请求执行 Prefill，让它们进入后续 Decode 流。
+
+    当前版本为了教学清晰，每条请求持有紧凑连续 KV Cache。动态组成 batch 时需要
+    pack/unpack，这也是现阶段连续模式性能较差、下一步引入 Paged KV Cache 的原因。
+    """
 
     def __init__(
         self,
@@ -57,9 +78,23 @@ class ContinuousBatchEngine:
         self.device = next(model.parameters()).device
         self.pad_token_id = pad_token_id
         self.scheduler = Scheduler(max_num_seqs)
+
+        # 资源表和状态表都使用 request_id 关联，但所有权不同：
+        # Scheduler 管请求状态；Engine 管 GPU Tensor 和随机数生成器。
+        #
+        # _caches[request_id][layer] = (key, value)
+        # 单请求每层形状为 [1, kv_heads, sequence_length, head_dim]。
         self._caches: dict[int, list[KVCache]] = {}
+
+        # 每条请求独立随机流，避免其他请求加入/退出 batch 后改变它的采样结果。
         self._generators: dict[int, torch.Generator | None] = {}
+
+        # Scheduler.finished 侧重状态查询；_all_sequences 保留稳定的提交顺序，
+        # 最终返回结果时按 request_id 对齐用户提交的 prompts。
         self._all_sequences: list[Sequence] = []
+
+        # 以下字段记录整个 Engine 执行生命周期。step() 和 run() 共用它们，
+        # 所以既支持一次跑完，也支持服务端在轮次之间插入在线请求。
         self._run_started = 0.0
         self._finish_seconds: dict[int, float] = {}
         self._iterations: list[EngineIteration] = []
@@ -74,6 +109,12 @@ class ContinuousBatchEngine:
         eos_token_ids: set[int],
         sampling_params: SamplingParams | None = None,
     ) -> int:
+        """把请求交给 Scheduler，并准备请求级采样随机流。
+
+        此时请求仍是 WAITING，不会创建 KV Cache。只有真正被接纳并完成 Prefill 后，
+        _caches 中才会出现对应条目，避免排队请求提前占用显存。
+        """
+
         sequence = self.scheduler.add_request(
             prompt_token_ids,
             max_new_tokens=max_new_tokens,
@@ -86,6 +127,8 @@ class ContinuousBatchEngine:
 
     @torch.inference_mode()
     def run(self) -> ContinuousBatchResult:
+        """持续调用 step，直到 waiting 和 running 都为空。"""
+
         if not self._all_sequences:
             raise ValueError("引擎中没有请求")
 
@@ -118,18 +161,28 @@ class ContinuousBatchEngine:
 
     @torch.inference_mode()
     def step(self) -> EngineIteration:
-        """执行一个调度轮次，调用方可在轮次之间继续添加请求。"""
+        """执行一个调度轮次，调用方可在轮次之间继续添加请求。
+
+        为什么先 Decode 再 Admit：
+
+        - Decode 可能让短请求在本轮结束；
+        - Scheduler 立即删除这些 RUNNING 请求；
+        - 随后的 Admit 可以在同一轮复用刚释放的槽位。
+
+        如果先 Admit，轮次开始时看不到这些即将释放的槽位，新请求会无谓多等一轮。
+        """
 
         if self.scheduler.is_done:
             raise RuntimeError("当前没有可调度请求")
         self._ensure_execution_started()
         step = self._step_index
 
-        # 先推进已经在运行的请求。它们完成后立即释放槽位。
+        # running 是进入本轮前的快照。执行期间 Scheduler 可能删除其中的完成请求，
+        # 但 tuple 本身稳定，不会出现遍历字典时修改集合的问题。
         decode_sequences = self.scheduler.running
         decode_seconds = self._execute_decode(decode_sequences, step=step)
 
-        # 同一轮内马上用 FIFO 等待队列补满空槽，并执行新请求 prefill。
+        # 这里只返回新接纳请求。旧 running 已经在上面 Decode 过，不能再 Prefill。
         prefill_sequences = self.scheduler.admit_waiting(step=step)
         prefill_seconds = self._execute_prefill(prefill_sequences, step=step)
 
@@ -149,6 +202,8 @@ class ContinuousBatchEngine:
         return iteration
 
     def _ensure_execution_started(self) -> None:
+        """第一次 step 时初始化计时，后续在线请求不会重置全局时间线。"""
+
         if self._execution_started:
             return
         if self.device.type == "cuda":
@@ -164,9 +219,17 @@ class ContinuousBatchEngine:
         *,
         step: int,
     ) -> float:
+        """批量处理新请求的完整 Prompt，并建立各自第一份 KV Cache。
+
+        不同长度 Prompt 只在本次模型调用中左 padding。模型返回后会立刻按 mask
+        拆回每条请求自己的紧凑缓存，padding 不会永久占据请求缓存。
+        """
+
         if not sequences:
             return 0.0
 
+        # 左 padding 保证每行最后一个位置都是真实 Prompt 末 token，
+        # 因而 last_token_only=True 可以统一取得首个生成 token 的 logits。
         max_length = max(len(sequence.prompt_token_ids) for sequence in sequences)
         input_rows = []
         mask_rows = []
@@ -194,9 +257,13 @@ class ContinuousBatchEngine:
         self._stop_timing()
         elapsed = time.perf_counter() - started
 
+        # 模型返回的是规则 batch cache。Scheduler 不应知道 Tensor 细节，
+        # Engine 在这里拆成 request_id -> per-layer cache。
         caches = self._unpack_cache(packed_cache, attention_mask)
         next_tokens = self._sample_rows(logits[:, -1], sequences)
         for index, sequence in enumerate(sequences):
+            # 必须先保存本轮缓存，再提交 token。未完成请求下轮 Decode 要使用它；
+            # 若 token 让请求完成，下面会马上 release，不会造成长期泄漏。
             self._caches[sequence.request_id] = caches[index]
             finish_reason = self.scheduler.append_token(
                 sequence,
@@ -216,16 +283,23 @@ class ContinuousBatchEngine:
         *,
         step: int,
     ) -> float:
+        """让所有旧 RUNNING 请求各向前生成一个 token。
+
+        输入只有每条请求上轮生成的最后一个 token；历史上下文全部来自 KV Cache。
+        """
+
         if not sequences:
             return 0.0
 
+        # 每条请求的缓存长度可能不同，先临时补齐为规则 batch。
         packed_cache, attention_mask = self._pack_cache(sequences)
         input_ids = torch.tensor(
             [[sequence.last_token_id] for sequence in sequences],
             dtype=torch.long,
             device=self.device,
         )
-        # 当前 decode token 是有效 key，所以在历史 mask 后追加一列 1。
+        # packed cache 的 mask 只描述历史 token。模型还会把 current_input 产生的
+        # 新 K/V 追加进去，因此 mask 也必须追加一列 1 与总 key 长度对齐。
         attention_mask = torch.cat(
             (
                 attention_mask,
@@ -249,6 +323,7 @@ class ContinuousBatchEngine:
         self._stop_timing()
         elapsed = time.perf_counter() - started
 
+        # present 已包含“历史缓存 + 当前 decode token”，再拆回各请求紧凑形式。
         caches = self._unpack_cache(packed_present, attention_mask)
         next_tokens = self._sample_rows(logits[:, -1], sequences)
         for index, sequence in enumerate(sequences):
@@ -269,6 +344,23 @@ class ContinuousBatchEngine:
         self,
         sequences: tuple[Sequence, ...],
     ) -> tuple[list[KVCache], torch.Tensor]:
+        """把不同长度的请求缓存临时拼成模型可接受的规则 batch。
+
+        输入示意：
+
+            request A: [valid valid]
+            request B: [valid valid valid valid]
+
+        左补齐后：
+
+            request A: [  pad   pad valid valid]
+            request B: [valid valid valid valid]
+
+        返回的 attention_mask 标出哪些位置真实有效。这个过程在 28 层上都会发生，
+        包含分配、补零和 cat，是当前连续引擎的主要性能瓶颈。
+        """
+
+        # 所有层的序列长度相同，读取第 0 层 Key 即可得到每条请求缓存长度。
         cache_lengths = [
             self._caches[sequence.request_id][0][0].shape[2]
             for sequence in sequences
@@ -293,6 +385,7 @@ class ContinuousBatchEngine:
                 key, value = self._caches[sequence.request_id][layer_index]
                 padding = max_length - length
                 if padding:
+                    # KV Cache 在 sequence 维（dim=2）左侧补零，与 attention mask 对齐。
                     key_padding = key.new_zeros(
                         (1, key.shape[1], padding, key.shape[3])
                     )
@@ -313,6 +406,15 @@ class ContinuousBatchEngine:
         packed_cache: list[KVCache],
         attention_mask: torch.Tensor,
     ) -> list[list[KVCache]]:
+        """按 attention_mask 去除临时 padding，恢复每条请求的紧凑缓存。
+
+        返回布局是：
+
+            unpacked[batch_index][layer_index] = (key, value)
+
+        这样请求退出或重新组成不同 batch 时，都不依赖上一轮的 batch 行号。
+        """
+
         batch_size = attention_mask.shape[0]
         unpacked: list[list[KVCache]] = [[] for _ in range(batch_size)]
         valid_masks = attention_mask.to(torch.bool)
@@ -332,6 +434,8 @@ class ContinuousBatchEngine:
         logits: torch.Tensor,
         sequences: tuple[Sequence, ...],
     ) -> torch.Tensor:
+        """按 batch 行与 Sequence 一一对应，使用请求自己的采样参数和随机流。"""
+
         return torch.stack(
             [
                 sample_next_token(
@@ -347,6 +451,8 @@ class ContinuousBatchEngine:
         self,
         sequence: Sequence,
     ) -> torch.Generator | None:
+        """为请求创建稳定随机流；request_id 使相同基础 seed 的请求彼此独立。"""
+
         params = sequence.sampling_params
         if params.is_greedy:
             return None
@@ -358,6 +464,12 @@ class ContinuousBatchEngine:
         return generator
 
     def _release(self, request_id: int) -> None:
+        """释放请求级执行资源。
+
+        Scheduler 已在 append_token 中释放逻辑运行槽；这里释放 GPU Cache 和随机流。
+        两部分都完成后，这条请求才真正不再占用引擎运行资源。
+        """
+
         self._caches.pop(request_id, None)
         self._generators.pop(request_id, None)
 
