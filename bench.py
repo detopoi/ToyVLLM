@@ -140,7 +140,7 @@ def run_paged_benchmark(
         raise ValueError("--batch-size 和 --num-requests 必须大于 0")
     warmup = 1 if args.warmup is None else args.warmup
     iterations = 3 if args.iterations is None else args.iterations
-    label = args.label or "stage-09c-paged-attention-reference"
+    label = args.label or "stage-10a-triton-paged-attention"
     config = ModelConfig.from_pretrained(args.model)
     prompt_ids = tokenizer.encode_chat(
         [{"role": "user", "content": args.prompt}],
@@ -175,25 +175,39 @@ def run_paged_benchmark(
     for _ in range(warmup):
         run_engine("gather")
         run_engine("paged")
+        run_engine("triton")
 
     gather_results = []
     paged_results = []
+    triton_results = []
     for iteration in range(iterations):
-        if iteration % 2 == 0:
-            gather_results.append(run_engine("gather"))
-            paged_results.append(run_engine("paged"))
-        else:
-            paged_results.append(run_engine("paged"))
-            gather_results.append(run_engine("gather"))
+        order = (
+            ("gather", "paged", "triton")
+            if iteration % 2 == 0
+            else ("triton", "paged", "gather")
+        )
+        for backend in order:
+            result = run_engine(backend)
+            if backend == "gather":
+                gather_results.append(result)
+            elif backend == "paged":
+                paged_results.append(result)
+            else:
+                triton_results.append(result)
 
     gather_seconds = sum(result.total_seconds for result in gather_results)
     paged_seconds = sum(result.total_seconds for result in paged_results)
+    triton_seconds = sum(result.total_seconds for result in triton_results)
     gather_tokens = sum(
         result.total_output_tokens for result in gather_results
     )
     paged_tokens = sum(result.total_output_tokens for result in paged_results)
+    triton_tokens = sum(
+        result.total_output_tokens for result in triton_results
+    )
     gather_tps = gather_tokens / gather_seconds
     paged_tps = paged_tokens / paged_seconds
+    triton_tps = triton_tokens / triton_seconds
     metrics = {
         "backend": "paged",
         "max_num_seqs": args.batch_size,
@@ -201,18 +215,23 @@ def run_paged_benchmark(
         "iterations": iterations,
         "gather_tokens_per_second": gather_tps,
         "paged_tokens_per_second": paged_tps,
-        "speedup": paged_tps / gather_tps,
+        "triton_tokens_per_second": triton_tps,
+        "speedup_vs_pytorch": triton_tps / paged_tps,
+        "speedup_vs_gather": triton_tps / gather_tps,
         "gather_peak_memory_mib": max(
             result.peak_memory_mib for result in gather_results
         ),
         "paged_peak_memory_mib": max(
             result.peak_memory_mib for result in paged_results
         ),
+        "triton_peak_memory_mib": max(
+            result.peak_memory_mib for result in triton_results
+        ),
         "num_kv_blocks": args.num_kv_blocks,
         "block_size": args.block_size,
     }
 
-    print("Paged Attention: 9B gather vs 9C online softmax")
+    print("Paged Attention: Gather vs PyTorch vs Triton")
     print(f"  请求数/最大并发 : {args.num_requests}/{args.batch_size}")
     print(f"  生成上限       : {limits}")
     print(
@@ -220,12 +239,21 @@ def run_paged_benchmark(
         f"{args.block_size} tokens"
     )
     print(f"  Paged 9B gather 吞吐: {gather_tps:.2f} tokens/s")
-    print(f"  Paged 9C online 吞吐: {paged_tps:.2f} tokens/s")
-    print(f"  吞吐倍率       : {metrics['speedup']:.2f}x")
+    print(f"  Paged 9C PyTorch 吞吐: {paged_tps:.2f} tokens/s")
+    print(f"  Paged Triton 吞吐    : {triton_tps:.2f} tokens/s")
     print(
-        "  Gather/Online 峰值显存: "
+        "  Triton/PyTorch 倍率  : "
+        f"{metrics['speedup_vs_pytorch']:.2f}x"
+    )
+    print(
+        "  Triton/Gather 倍率   : "
+        f"{metrics['speedup_vs_gather']:.2f}x"
+    )
+    print(
+        "  Gather/PyTorch/Triton 峰值显存: "
         f"{metrics['gather_peak_memory_mib']:.1f} / "
-        f"{metrics['paged_peak_memory_mib']:.1f} MiB"
+        f"{metrics['paged_peak_memory_mib']:.1f} / "
+        f"{metrics['triton_peak_memory_mib']:.1f} MiB"
     )
 
     if args.save:

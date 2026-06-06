@@ -1706,10 +1706,187 @@ Benchmark：
     --save benchmarks/results.jsonl
 ```
 
+### 2026-06-06：第 10A 步，第一个 Triton Paged Attention Kernel
+
+9C 的 PyTorch 参考实现已经证明了分页 Attention 的数学和生命周期，但它在 Python 中
+循环请求、物理 Block，并为每个小操作启动 GPU Kernel。10A 的目标很克制：
+
+> 不追求生产级全功能，先把单 token Decode 的 Block 扫描和在线 softmax 放进一个
+> Triton Kernel。
+
+#### 1. 环境选择
+
+当前环境保持：
+
+```text
+Python          3.10
+PyTorch         2.2.2+cu121
+GPU             RTX 4060 Ti 8GB
+NVIDIA Driver   591.74
+Triton Windows  3.1.0.post17
+```
+
+这里只安装 `triton-windows`，没有升级已经验证过的 PyTorch：
+
+```powershell
+& $PYTHON -m pip install triton-windows==3.1.0.post17
+```
+
+项目把它放在可选依赖 `triton-windows` 中。没有 Triton 时，CLI 的 `auto` 会回退到
+PyTorch `paged` 后端；显式指定 `triton` 则会给出缺少依赖的错误。
+
+#### 2. 一个 Triton Program 负责什么
+
+Kernel 使用二维 Grid：
+
+```text
+grid = [batch_size, num_query_heads]
+```
+
+因此一个 Program 负责：
+
+```text
+一条请求 + 一个 Query Head + 当前模型层
+```
+
+它会：
+
+1. 把当前 Query Head 加载进寄存器
+2. 根据 GQA 映射算出对应的 KV Head
+3. 读取该请求的 `context_length`
+4. 顺序遍历 GPU BlockTable 中的逻辑块
+5. 按物理块编号加载 K/V
+6. 在寄存器中更新 `running_max/running_sum/accumulator`
+7. 扫描结束后写出一个 Attention Head
+
+Python 不再循环请求和物理块。模型每层只发射一次 Triton Kernel。
+
+#### 3. BlockTable 为什么要变成 GPU Tensor
+
+9C 的 `BlockTable` 是 CPU dataclass，适合 Scheduler 修改和单元测试。但 GPU Kernel
+不能直接读取 Python 对象，因此 Engine 每轮 Decode 把本 Batch 的表打包为：
+
+```text
+block_table_tensor : [batch, max_num_blocks], int32
+context_lengths    : [batch], int32
+```
+
+较短请求用 `-1` 补齐 BlockTable。Kernel 不依赖 `-1` 本身，而是根据
+`context_lengths` 产生 token mask，所以不会读取补位地址。
+
+这一步仍有小额 CPU 到 GPU 元数据复制。生产引擎通常维护常驻 GPU 的 BlockTable，
+后续只增量修改变化部分；当前版本先保持数据流直观。
+
+#### 4. 为什么先把当前 token 放入在线 softmax
+
+Kernel 初始化时直接计算当前 token 的 score，并设置：
+
+```text
+running_max = current_score
+running_sum = 1
+accumulator = current_value
+```
+
+好处有两个：
+
+- 当前 token 本来就必须参与因果 Attention
+- 状态一开始就是有限值
+
+如果从 `running_max=-inf` 开始，而某个补齐 Block 全部无效，就可能计算
+`-inf - -inf` 产生 NaN。用当前 token 初始化后，无效 Block 的权重自然为 0。
+
+#### 5. GQA 映射
+
+每个 Program 已知自己的 `query_head`，对应 KV Head 为：
+
+```text
+kv_head = query_head // queries_per_kv
+```
+
+因此不需要 `repeat_interleave` 复制 K/V。当前简单 Kernel 仍会让属于同一 KV Head 的
+多个 Query Program 各自读取一遍 K/V，后续可以让一个 Program 同时处理一组 Query Head。
+
+#### 6. JIT 编译与缓存
+
+Triton 第一次遇到新形状时需要 JIT 编译。冷启动不能计入稳态吞吐 Benchmark，所以：
+
+- `bench.py` 先执行 Warmup
+- `layer_index` 是运行时参数，28 层共享同一份 Kernel
+- `head_dim/block_size/max_blocks` 才作为编译期常量
+- JIT 缓存默认写入系统临时目录 `toy-vllm-triton-cache`
+
+第一次真实模型命令包含编译时只有 `0.89 tokens/s`；缓存命中后，同类短任务恢复到
+`18.50 tokens/s`。这说明测 GPU Kernel 必须区分冷启动和稳态。
+
+#### 7. 标准 Benchmark
+
+工作负载保持不变：
+
+```text
+请求数       8
+最大并发     4
+Prompt       18 token
+生成上限     [4, 16, 4, 16, 4, 16, 4, 16]
+Block Pool   64 blocks
+Block Size   16 tokens
+Warmup       1
+Iterations   3
+```
+
+结果：
+
+| Attention 路径 | 总输出吞吐 | 峰值显存 |
+|---|---:|---:|
+| 9B Gather + SDPA | 57.31 tokens/s | 4026.0 MiB |
+| 9C PyTorch 在线 softmax | 26.76 tokens/s | 4008.2 MiB |
+| 10A Triton Paged Attention | 77.69 tokens/s | 4008.2 MiB |
+
+Triton 相对 PyTorch 参考版提升 `2.90x`，相对 Gather + SDPA 提升 `1.36x`。它保留了
+不构造连续历史 Cache 的显存收益，同时通过 Kernel Fusion 消除了 Python 小算子开销。
+
+#### 8. 当前 Kernel 的限制
+
+为了保持第一版容易理解，当前只支持：
+
+- 单 token Decode，不处理 Prefill
+- `head_dim <= 256`
+- 一个 Program 处理一个 Query Head
+- 逻辑 Block 在一个 Program 内串行扫描
+- 固定 `num_warps=4`，尚未 autotune
+- 没有 Split-K、Tensor Core 专门优化或跨 Query Head 共享 KV
+
+这不是 vLLM 生产 Kernel 的完整复刻，但已经建立了最关键的连接：
+
+```text
+Scheduler BlockTable
+        -> GPU 元数据
+        -> Triton Paged Attention
+        -> 在线 softmax
+        -> 模型输出
+```
+
+#### 9. 运行方式
+
+自动选择 Triton，缺失时回退：
+
+```powershell
+& $PYTHON -m toyvllm continuous --cache-backend paged `
+    --paged-attention auto --num-kv-blocks 64 --block-size 16 `
+    --max-num-seqs 4 "你好" "解释 KV Cache"
+```
+
+三路径 Benchmark：
+
+```powershell
+& $PYTHON bench.py --backend paged --batch-size 4 --num-requests 8 `
+    --short-new-tokens 4 --max-new-tokens 16 --warmup 1 --iterations 3 `
+    --save benchmarks/results.jsonl
+```
+
 ### 当前验证结果
 
 ```text
-51 个测试全部通过
+52 个测试全部通过
 Python compileall 通过
 CUDA、BF16、真实权重加载通过
 Tokenizer 普通文本往返和聊天模板测试通过
@@ -1723,6 +1900,8 @@ Paged Block 分配、回收、离散映射和 K/V 读写通过
 Paged Engine Prefill、Decode、Admission 与完整 Block 回收通过
 Paged Attention 在线 softmax 与连续 Attention 对齐
 Paged Decode 已验证不会调用 read_batch Gather
+Triton 与 PyTorch Paged Attention 在不同长度 Batch 上对齐
+真实 Qwen3-1.7B BF16 Triton 推理通过
 多种上下文长度的 benchmark 已写入 benchmarks/results.jsonl
 ```
 
@@ -1743,4 +1922,6 @@ Paged Decode 已验证不会调用 read_batch Gather
   - [x] 第 9B 步：Engine 接入分页缓存
   - [x] 第 9C 步：Paged Attention 直接按 Block Table 读取
 - [ ] 第 10 步：性能测量与优化
+  - [x] 第 10A 步：Triton 单 token Paged Attention
+  - [ ] 第 10B 步：BlockTable 常驻 GPU 与 Kernel 调优
 - [ ] 第 11 步：HTTP 服务（可选）

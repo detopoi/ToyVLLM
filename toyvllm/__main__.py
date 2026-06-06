@@ -132,9 +132,9 @@ def build_parser() -> argparse.ArgumentParser:
     continuous_parser.add_argument("--block-size", type=int, default=16)
     continuous_parser.add_argument(
         "--paged-attention",
-        choices=("gather", "paged"),
-        default="paged",
-        help="paged 后端的 Attention：9B gather 或 9C 分块在线 softmax",
+        choices=("auto", "gather", "paged", "triton"),
+        default="auto",
+        help="paged 后端的 Attention：9B gather、9C PyTorch 或 Triton Kernel",
     )
     continuous_parser.add_argument("--thinking", action="store_true")
     continuous_parser.add_argument(
@@ -283,7 +283,7 @@ def main() -> None:
                 f"KV Blocks：{args.num_kv_blocks} × "
                 f"{args.block_size} tokens"
             )
-            print(f"Paged Attention：{args.paged_attention}")
+            print(f"Paged Attention：{engine.attention_backend}")
         print(f"解码策略：{format_sampling_params(sampling_params)}")
         print(f"调度轮数：{len(result.iterations)}")
         print(f"总输出吞吐：{result.output_tokens_per_second:.2f} tokens/s")

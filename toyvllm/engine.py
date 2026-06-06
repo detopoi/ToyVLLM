@@ -534,8 +534,18 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
             dtype=parameter.dtype,
             device=parameter.device,
         )
-        if attention_backend not in {"gather", "paged"}:
-            raise ValueError("attention_backend 必须是 gather 或 paged")
+        if attention_backend not in {"auto", "gather", "paged", "triton"}:
+            raise ValueError(
+                "attention_backend 必须是 auto、gather、paged 或 triton"
+            )
+        if attention_backend == "auto":
+            from toyvllm.kernels.paged_attention import is_triton_available
+
+            attention_backend = (
+                "triton"
+                if parameter.is_cuda and is_triton_available()
+                else "paged"
+            )
         self.attention_backend = attention_backend
 
         # 父类的 _caches 属于连续 Tensor 后端。分页后端不使用它，
@@ -653,7 +663,10 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
             self.block_manager.get_block_table(sequence.request_id)
             for sequence in sequences
         )
-        paged_attention = self.paged_cache.attention_metadata(history_tables)
+        paged_attention = self.paged_cache.attention_metadata(
+            history_tables,
+            backend=self.attention_backend,
+        )
 
         # 先原子预留写入槽位，避免模型算完后才发现容量不足。Attention 持有的是 reserve
         # 之前的不可变 BlockTable 快照，因此不会错误读取尚未写入的新槽位。

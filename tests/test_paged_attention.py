@@ -4,6 +4,7 @@ import torch
 
 from toyvllm.block_manager import BlockManager
 from toyvllm.kv_cache import PagedKVCache
+from toyvllm.kernels.paged_attention import is_triton_available
 from toyvllm.layers.attention import Qwen3Attention
 
 
@@ -57,6 +58,65 @@ class PagedAttentionTest(unittest.TestCase):
 
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
         self.assertEqual(present[0].shape, (1, 2, 1, 8))
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and is_triton_available(),
+        "需要 CUDA 和 Triton",
+    )
+    def test_triton_matches_pytorch_paged_attention(self) -> None:
+        torch.manual_seed(1)
+        device = torch.device("cuda")
+        attention = Qwen3Attention(
+            hidden_size=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            rope_theta=1_000_000.0,
+        ).to(device).eval()
+        manager = BlockManager(num_blocks=4, block_size=2)
+        manager.allocate(10, num_tokens=2)
+        first_table = manager.allocate(20, num_tokens=3)
+        manager.free(10)
+        second_table = manager.allocate(30, num_tokens=1)
+        tables = (first_table, second_table)
+
+        cache = PagedKVCache(
+            num_layers=1,
+            num_blocks=4,
+            block_size=2,
+            num_kv_heads=2,
+            head_dim=8,
+            dtype=torch.float32,
+            device=device,
+        )
+        first_key = torch.randn(1, 2, 3, 8, device=device)
+        first_value = torch.randn(1, 2, 3, 8, device=device)
+        second_key = torch.randn(1, 2, 1, 8, device=device)
+        second_value = torch.randn(1, 2, 1, 8, device=device)
+        cache.write(first_table.slots(), [(first_key, first_value)])
+        cache.write(second_table.slots(), [(second_key, second_value)])
+        hidden_states = torch.randn(2, 1, 32, device=device)
+
+        expected, _ = attention(
+            hidden_states,
+            paged_attention=cache.attention_metadata(
+                tables,
+                backend="paged",
+            ),
+            use_cache=True,
+        )
+        actual, _ = attention(
+            hidden_states,
+            paged_attention=cache.attention_metadata(
+                tables,
+                backend="triton",
+            ),
+            use_cache=True,
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
 
 if __name__ == "__main__":
