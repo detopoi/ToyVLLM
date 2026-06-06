@@ -35,7 +35,7 @@ def load_model(
 
     # meta 参数只有形状和 dtype，没有真实内存。否则普通构造会先生成约 8 GB 的
     # FP32 随机参数，随后加载 BF16 权重时还要再占约 4 GB，8 GB 显卡无法承受。
-    with torch.device("meta"):
+    with torch.device("meta"):  # 只有 meta 没有具体随机化数据
         model = Qwen3ForCausalLM(config)
 
     index_path = config.model_path / "model.safetensors.index.json"

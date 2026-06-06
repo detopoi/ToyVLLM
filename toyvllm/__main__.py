@@ -4,7 +4,7 @@ import argparse
 
 from toyvllm.config import ModelConfig
 from toyvllm.environment import inspect_environment
-from toyvllm.generation import generate_greedy_naive
+from toyvllm.generation import generate_greedy_cached, generate_greedy_naive
 from toyvllm.tokenizer import ChatMessage, Tokenizer
 from toyvllm.weight_loader import load_model
 
@@ -27,6 +27,12 @@ def build_parser() -> argparse.ArgumentParser:
     generate_parser.add_argument("prompt", nargs="?", default="用一句话解释 KV Cache。")
     generate_parser.add_argument("--max-new-tokens", type=int, default=16)
     generate_parser.add_argument("--thinking", action="store_true")
+    generate_parser.add_argument(
+        "--backend",
+        choices=("naive", "cached"),
+        default="cached",
+        help="naive 每步重算完整序列；cached 复用 KV Cache",
+    )
     return parser
 
 
@@ -62,18 +68,25 @@ def main() -> None:
         )
 
         loaded = load_model(config, device="cuda")
-        result = generate_greedy_naive(
+        generate = (
+            generate_greedy_cached
+            if args.backend == "cached"
+            else generate_greedy_naive
+        )
+        result = generate(
             loaded.model,
             prompt_token_ids,
             max_new_tokens=args.max_new_tokens,
             eos_token_ids=set(config.generation_eos_token_ids),
         )
         print(f"模型加载：{loaded.load_seconds:.2f} s")
+        print(f"推理后端：{args.backend}")
         print(f"输入 token：{len(prompt_token_ids)}")
         print(f"输出 token：{len(result.output_token_ids)}")
         print(f"TTFT：{result.ttft_ms:.2f} ms")
         print(f"TPOT：{result.tpot_ms:.2f} ms")
         print(f"输出吞吐：{result.output_tokens_per_second:.2f} tokens/s")
+        print(f"Decode 吞吐：{result.decode_tokens_per_second:.2f} tokens/s")
         print(f"峰值显存：{result.peak_memory_mib:.1f} MiB")
         print("\n模型输出：")
         print(tokenizer.decode(result.output_token_ids, skip_special_tokens=True))

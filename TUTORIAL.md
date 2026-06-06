@@ -397,7 +397,7 @@ Qwen3-1.7B 中，一层的数据流可以简化为：
 ```text
 hidden_states
   ├─ residual ───────────────────────────────┐
-  └─ RMSNorm → GQA Attention → 相加残差 ────┘
+  └─ RMSNorm → GQA Attention → 相加残差 ──────┘
                      │
                      ├─ residual ────────────┐
                      └─ RMSNorm → SwiGLU → 相加残差
@@ -495,16 +495,100 @@ iterations       3
 本机 PyTorch 2.2.2 的 Windows 构建没有包含 Flash Attention，SDPA 会退回其他 CUDA
 实现。当前阶段接受这一点，因为下一步要测量的是 KV Cache 消除重复计算所带来的收益。
 
+### 2026-06-06：完成第 5 步，连续 KV Cache
+
+本次让 Attention、Decoder Layer 和完整模型都能接收并返回 `past_key_values`。
+每层缓存两个张量：
+
+```text
+Key   [batch, num_kv_heads, cached_tokens, head_dim]
+Value [batch, num_kv_heads, cached_tokens, head_dim]
+```
+
+Qwen3-1.7B 的具体形状是：
+
+```text
+[batch, 8, cached_tokens, 128]
+```
+
+缓存保持 8 个原始 KV Head，不保存 GQA 展开后的 16 个 Head，否则 KV Cache 显存会翻倍。
+
+生成现在分成两个阶段：
+
+```text
+Prefill:
+  一次输入完整 prompt
+  为每一层计算并保存 prompt 的 K/V
+  得到第一个输出 token
+
+Decode:
+  每次只输入刚生成的 1 个 token
+  读取历史 K/V，并追加当前 token 的 K/V
+  得到下一个输出 token
+```
+
+位置编码和 mask 有一个容易出错的细节。假设缓存中已有 100 个 token，decode 输入的第一个
+token 的绝对位置是 100，而不是 0。若对形状 `[query=1, key=101]` 直接使用普通左上角
+causal mask，query 可能只能看到第 0 个 key。当前实现根据 `past_length` 计算绝对
+`position_ids`；单 token decode 允许访问全部历史，多 token chunk 则构造带位置偏移的 mask。
+
+正确性验证：
+
+- 小随机模型的 cached logits 与完整序列 logits 一致
+- 一次输入多个 cached chunk 时结果也一致
+- cached greedy 与 naive greedy 的输出 token 完全一致
+- 真实 Qwen3-1.7B 的 16 个输出 token 逐个一致
+
+真实输出片段：
+
+```text
+“KV Cache” 是 Key-Value Cache 的缩写，是一种
+```
+
+#### Benchmark 结果
+
+所有数据均为 greedy、16 个输出 token、warmup 1、iterations 3。TTFT 包含 prompt
+prefill；Decode 吞吐排除首 token，只衡量后续 token。
+
+| 输入长度 | 后端 | TTFT | TPOT | Decode 吞吐 | 峰值显存 |
+|---:|---|---:|---:|---:|---:|
+| 18 token | naive | 26.84 ms | 30.24 ms | 33.07 tokens/s | 3886.5 MiB |
+| 18 token | cached | 28.51 ms | 29.00 ms | 34.48 tokens/s | 3892.1 MiB |
+| 252 token | naive | 69.62 ms | 68.36 ms | 14.63 tokens/s | 3900.0 MiB |
+| 252 token | cached | 71.35 ms | 71.84 ms | 13.92 tokens/s | 3945.1 MiB |
+| 1020 token | naive | 103.89 ms | 104.74 ms | 9.55 tokens/s | 3941.3 MiB |
+| 1020 token | cached | 103.35 ms | 72.05 ms | 13.88 tokens/s | 4119.1 MiB |
+
+1020-token 上下文中，KV Cache 让 Decode 吞吐提高约 45%，TPOT 降低约 31%。
+但在 18 token 时提升很小，252 token 时甚至略慢。这说明“计算量减少”不必然等于
+“实际耗时立刻减少”。
+
+naive 每轮重新处理整段序列，矩阵较大，GPU 利用率较高。cached 每层只处理一个新 token，
+把大矩阵乘法变成了大量小矩阵向量计算，还增加 Python 调度、缓存拼接和内存访问。
+在单请求、短上下文下，这些固定开销可能抵消节省的 FLOPs。上下文足够长后，避免重复计算
+历史 token 的收益才超过这些开销。
+
+这也解释了为什么真实推理引擎还需要连续批处理：把多个请求的新 token 合并成一个 batch，
+可以让 cached decode 重新形成较大的矩阵计算，提高 GPU 利用率。
+
+当前缓存仍有两个刻意保留的低效点：
+
+1. 每轮使用 `torch.cat` 重新分配更长的连续 K/V。
+2. Attention 临时把 8 个 KV Head 展开到 16 个 Query Head。
+
+后续 Paged KV Cache 和 Attention 优化会继续处理这些问题。
+
 ### 当前验证结果
 
 ```text
-15 个测试全部通过
+18 个测试全部通过
 Python compileall 通过
 CUDA、BF16、真实权重加载通过
 Tokenizer 普通文本往返和聊天模板测试通过
 单层结果与 Transformers 官方 Qwen3 对齐
 真实 Qwen3-1.7B greedy 生成通过
-Tokenizer 和 stage-04-naive 结果已写入 benchmarks/results.jsonl
+Naive 与 cached 生成结果一致
+多种上下文长度的 benchmark 已写入 benchmarks/results.jsonl
 ```
 
 ## 当前进度
@@ -515,7 +599,7 @@ Tokenizer 和 stage-04-naive 结果已写入 benchmarks/results.jsonl
 - [x] 第 2 步：实现 Qwen3 基础层
 - [x] 第 3 步：组装模型并加载权重
 - [x] 第 4 步：朴素文本生成
-- [ ] 第 5 步：连续 KV Cache
+- [x] 第 5 步：连续 KV Cache
 - [ ] 第 6 步：采样策略
 - [ ] 第 7 步：静态批处理
 - [ ] 第 8 步：连续批处理与调度器
