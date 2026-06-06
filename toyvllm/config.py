@@ -38,6 +38,10 @@ class ModelConfig:
     bos_token_id: int
     eos_token_id: int
     generation_eos_token_ids: tuple[int, ...] = ()
+    generation_do_sample: bool = True
+    generation_temperature: float = 0.6
+    generation_top_k: int = 20
+    generation_top_p: float = 0.95
 
     @classmethod
     def from_pretrained(cls, model_path: str | Path) -> "ModelConfig":
@@ -78,6 +82,12 @@ class ModelConfig:
             generation_eos_token_ids=cls._normalize_token_ids(
                 generation_raw.get("eos_token_id", raw["eos_token_id"])
             ),
+            generation_do_sample=bool(generation_raw.get("do_sample", False)),
+            generation_temperature=float(
+                generation_raw.get("temperature", 1.0)
+            ),
+            generation_top_k=int(generation_raw.get("top_k", 0)),
+            generation_top_p=float(generation_raw.get("top_p", 1.0)),
         )
         config._validate()
         return config

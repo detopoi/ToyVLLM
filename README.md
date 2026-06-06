@@ -33,6 +33,15 @@ $PYTHON = "C:\Users\Administrator\AppData\Local\Programs\Python\Python310\python
 
 需要运行旧的重算基线时增加 `--backend naive`。
 
+使用 Qwen3 推荐的采样参数：
+
+```powershell
+& $PYTHON -m toyvllm --model Qwen3-1.7B generate --sample --seed 123 `
+    --max-new-tokens 32 "写一句关于夜空的短句。"
+```
+
+也可以通过 `--temperature`、`--top-k` 和 `--top-p` 覆盖模型默认值。
+
 运行测试：
 
 ```powershell
@@ -69,5 +78,12 @@ $PYTHON = "C:\Users\Administrator\AppData\Local\Programs\Python\Python310\python
 
 ```powershell
 & $PYTHON bench.py --backend cached --prompt-repeat 168 `
+    --warmup 1 --iterations 3 --max-new-tokens 16
+```
+
+测量采样开销：
+
+```powershell
+& $PYTHON bench.py --backend cached --sample --seed 123 `
     --warmup 1 --iterations 3 --max-new-tokens 16
 ```

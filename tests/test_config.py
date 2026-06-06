@@ -13,6 +13,10 @@ class ModelConfigTest(unittest.TestCase):
         self.assertEqual(self.config.num_hidden_layers, 28)
         self.assertEqual(self.config.queries_per_kv, 2)
         self.assertEqual(self.config.generation_eos_token_ids, (151645, 151643))
+        self.assertTrue(self.config.generation_do_sample)
+        self.assertEqual(self.config.generation_temperature, 0.6)
+        self.assertEqual(self.config.generation_top_k, 20)
+        self.assertEqual(self.config.generation_top_p, 0.95)
 
     def test_kv_cache_size(self) -> None:
         self.assertEqual(self.config.kv_cache_bytes_per_token, 114688)

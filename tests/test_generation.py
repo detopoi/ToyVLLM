@@ -5,6 +5,7 @@ import torch
 from tests.test_layers import tiny_config
 from toyvllm.generation import generate_greedy_cached, generate_greedy_naive
 from toyvllm.models.qwen3 import Qwen3ForCausalLM
+from toyvllm.sampling import SamplingParams
 
 
 class GenerationTest(unittest.TestCase):
@@ -30,6 +31,24 @@ class GenerationTest(unittest.TestCase):
             "prompt_token_ids": [1, 2, 3, 4],
             "max_new_tokens": 5,
             "eos_token_ids": set(),
+        }
+        naive = generate_greedy_naive(model, **arguments)
+        cached = generate_greedy_cached(model, **arguments)
+        self.assertEqual(cached.output_token_ids, naive.output_token_ids)
+
+    def test_sampled_generation_is_reproducible_across_backends(self) -> None:
+        torch.manual_seed(0)
+        model = Qwen3ForCausalLM(tiny_config()).eval()
+        arguments = {
+            "prompt_token_ids": [1, 2, 3, 4],
+            "max_new_tokens": 8,
+            "eos_token_ids": set(),
+            "sampling_params": SamplingParams(
+                temperature=0.8,
+                top_k=10,
+                top_p=0.9,
+                seed=123,
+            ),
         }
         naive = generate_greedy_naive(model, **arguments)
         cached = generate_greedy_cached(model, **arguments)
