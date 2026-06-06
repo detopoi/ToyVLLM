@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+benchmarks/*.jsonl
+.idea/
+Qwen3-1.7B/
