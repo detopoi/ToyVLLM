@@ -62,7 +62,18 @@ class BlockManagerTest(unittest.TestCase):
         self.assertFalse(manager.can_reserve(1, 6))
         self.assertEqual(manager.get_block_table(1), original)
 
+    def test_reserve_many_is_atomic_across_requests(self) -> None:
+        manager = BlockManager(num_blocks=3, block_size=2)
+        first = manager.allocate(1, num_tokens=2)
+        second = manager.allocate(2, num_tokens=2)
+
+        with self.assertRaises(OutOfBlocksError):
+            manager.reserve_many(((1, 3), (2, 1)))
+
+        self.assertEqual(manager.get_block_table(1), first)
+        self.assertEqual(manager.get_block_table(2), second)
+        self.assertEqual(manager.free_block_ids, (2,))
+
 
 if __name__ == "__main__":
     unittest.main()
-

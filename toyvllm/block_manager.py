@@ -163,6 +163,38 @@ class BlockManager:
         self._tables[request_id] = new_table
         return new_table.slots(old_table.num_tokens, new_num_tokens)
 
+    def reserve_many(
+        self,
+        requests: tuple[tuple[int, int], ...],
+    ) -> dict[int, tuple[PhysicalTokenSlot, ...]]:
+        """原子地为同一 Decode Batch 中的多条请求预留空间。
+
+        先汇总所有请求本轮需要的新物理块，确认总量足够后才逐条 reserve。
+        如果只对每条请求分别调用 can_reserve，多条请求可能都看到同一批空闲块并误判成功。
+        """
+
+        if not requests:
+            return {}
+        request_ids = [request_id for request_id, _ in requests]
+        if len(set(request_ids)) != len(request_ids):
+            raise ValueError("reserve_many 中 request_id 不能重复")
+
+        total_additional_blocks = 0
+        for request_id, num_new_tokens in requests:
+            if num_new_tokens <= 0:
+                raise ValueError("num_new_tokens 必须大于 0")
+            table = self.get_block_table(request_id)
+            required_total = self._blocks_for_tokens(
+                table.num_tokens + num_new_tokens
+            )
+            total_additional_blocks += required_total - table.num_blocks
+        self._require_free_blocks(total_additional_blocks)
+
+        return {
+            request_id: self.reserve(request_id, num_new_tokens)
+            for request_id, num_new_tokens in requests
+        }
+
     def free(self, request_id: int) -> tuple[int, ...]:
         """释放请求的全部物理块，并删除 Block Table。"""
 
@@ -186,6 +218,13 @@ class BlockManager:
         )
         additional = required_total - table.num_blocks
         return additional <= len(self._free_blocks)
+
+    def blocks_required_for_tokens(self, num_tokens: int) -> int:
+        """公开只读容量计算，供 Scheduler admission 使用。"""
+
+        if num_tokens < 0:
+            raise ValueError("num_tokens 不能为负数")
+        return self._blocks_for_tokens(num_tokens)
 
     def get_block_table(self, request_id: int) -> BlockTable:
         try:
@@ -217,4 +256,3 @@ class BlockManager:
             raise OutOfBlocksError(
                 f"KV Block 不足：需要 {required_blocks}，空闲 {available}"
             )
-
