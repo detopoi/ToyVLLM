@@ -4,7 +4,11 @@ import torch
 from torch import nn
 
 from toyvllm.config import ModelConfig
-from toyvllm.layers.attention import KVCache, Qwen3Attention
+from toyvllm.layers.attention import (
+    KVCache,
+    PagedAttentionMetadata,
+    Qwen3Attention,
+)
 from toyvllm.layers.mlp import Qwen3MLP
 from toyvllm.layers.rms_norm import RMSNorm
 
@@ -12,7 +16,7 @@ from toyvllm.layers.rms_norm import RMSNorm
 class Qwen3DecoderLayer(nn.Module):
     """一个完整 Qwen3 Decoder Layer：Attention + MLP + 两次残差连接。"""
 
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(self, config: ModelConfig, layer_index: int = 0) -> None:
         super().__init__()
         self.input_layernorm = RMSNorm(
             config.hidden_size,
@@ -25,6 +29,7 @@ class Qwen3DecoderLayer(nn.Module):
             head_dim=config.head_dim,
             rms_norm_eps=config.rms_norm_eps,
             rope_theta=config.rope_theta,
+            layer_index=layer_index,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
@@ -41,6 +46,7 @@ class Qwen3DecoderLayer(nn.Module):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         past_key_value: KVCache | None = None,
+        paged_attention: PagedAttentionMetadata | None = None,
         use_cache: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, KVCache]:
         # Pre-Norm 结构先归一化再进入子层。残差支路保留原信息，也让深层网络
@@ -52,6 +58,7 @@ class Qwen3DecoderLayer(nn.Module):
             position_ids,
             attention_mask=attention_mask,
             past_key_value=past_key_value,
+            paged_attention=paged_attention,
             use_cache=use_cache,
         )
         present_key_value = None
@@ -76,7 +83,8 @@ class Qwen3Model(nn.Module):
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
-            Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)
+            Qwen3DecoderLayer(config, layer_index)
+            for layer_index in range(config.num_hidden_layers)
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -86,12 +94,15 @@ class Qwen3Model(nn.Module):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         past_key_values: list[KVCache] | None = None,
+        paged_attention: PagedAttentionMetadata | None = None,
         use_cache: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]]:
         if input_ids.ndim != 2:
             raise ValueError("input_ids 的形状必须是 [batch, sequence]")
         if past_key_values is not None and len(past_key_values) != len(self.layers):
             raise ValueError("past_key_values 的层数与模型层数不一致")
+        if paged_attention is not None and past_key_values is not None:
+            raise ValueError("分页缓存和连续 past_key_values 不能同时使用")
 
         past_length = 0
         if past_key_values:
@@ -121,6 +132,7 @@ class Qwen3Model(nn.Module):
                 position_ids,
                 attention_mask=attention_mask,
                 past_key_value=layer_past,
+                paged_attention=paged_attention,
                 use_cache=use_cache,
             )
             if use_cache:
@@ -152,6 +164,7 @@ class Qwen3ForCausalLM(nn.Module):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         past_key_values: list[KVCache] | None = None,
+        paged_attention: PagedAttentionMetadata | None = None,
         use_cache: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]]:
         model_output = self.model(
@@ -159,6 +172,7 @@ class Qwen3ForCausalLM(nn.Module):
             position_ids=position_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
+            paged_attention=paged_attention,
             use_cache=use_cache,
         )
         present_key_values = None

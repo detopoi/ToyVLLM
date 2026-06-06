@@ -130,6 +130,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     continuous_parser.add_argument("--num-kv-blocks", type=int, default=64)
     continuous_parser.add_argument("--block-size", type=int, default=16)
+    continuous_parser.add_argument(
+        "--paged-attention",
+        choices=("gather", "paged"),
+        default="paged",
+        help="paged 后端的 Attention：9B gather 或 9C 分块在线 softmax",
+    )
     continuous_parser.add_argument("--thinking", action="store_true")
     continuous_parser.add_argument(
         "--show-schedule",
@@ -247,6 +253,7 @@ def main() -> None:
                 pad_token_id=tokenizer.pad_token_id,
                 num_blocks=args.num_kv_blocks,
                 block_size=args.block_size,
+                attention_backend=args.paged_attention,
             )
         else:
             engine = ContinuousBatchEngine(
@@ -276,6 +283,7 @@ def main() -> None:
                 f"KV Blocks：{args.num_kv_blocks} × "
                 f"{args.block_size} tokens"
             )
+            print(f"Paged Attention：{args.paged_attention}")
         print(f"解码策略：{format_sampling_params(sampling_params)}")
         print(f"调度轮数：{len(result.iterations)}")
         print(f"总输出吞吐：{result.output_tokens_per_second:.2f} tokens/s")

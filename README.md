@@ -124,15 +124,15 @@ $PYTHON = "C:\Users\Administrator\AppData\Local\Programs\Python\Python310\python
     --warmup 1 --iterations 3
 ```
 
-Paged KV Cache 当前完成了第一阶段：`BlockManager` 和物理 KV Block 池。此阶段主要通过
-`tests/test_block_manager.py` 和 `tests/test_paged_kv_cache.py` 学习分配与映射语义，
-并已完成第二阶段 Engine 接入。运行分页后端：
+Paged KV Cache 已完成 Block Manager、Engine 接入和教学版 Paged Attention。运行分页后端：
 
 ```powershell
 & $PYTHON -m toyvllm continuous --cache-backend paged `
+    --paged-attention paged `
     --num-kv-blocks 64 --block-size 16 --max-num-seqs 4 `
     "你好" "解释 KV Cache" "描述夏天"
 ```
 
-当前 Attention 前仍会把离散 Block gather 成临时连续 Cache；这个瓶颈将在 9C
-Paged Attention 阶段处理。
+`--paged-attention gather` 可运行 9B 旧路径作为对照；默认的 `paged` 直接按照
+Block Table 扫描物理 KV Block，并通过在线 softmax 避免构造完整连续历史 Cache。
+当前实现是纯 PyTorch 教学参考版，算法正确但尚未融合成高性能 Triton/CUDA Kernel。
