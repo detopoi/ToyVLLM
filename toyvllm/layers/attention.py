@@ -145,7 +145,11 @@ class Qwen3Attention(nn.Module):
             # 当前 token 的 K/V 一边参与本轮 Attention，一边作为 present 返回给 Engine，
             # 由 Engine 在模型前向结束后写入刚刚预留的物理槽位。
             present_key_value = (key, value)
-            if paged_attention.backend in {"triton", "triton-grouped"}:
+            if paged_attention.backend in {
+                "triton",
+                "triton-fixed",
+                "triton-grouped",
+            }:
                 attended = self._triton_paged_decode(
                     query,
                     key,
@@ -380,6 +384,7 @@ class Qwen3Attention(nn.Module):
             layer_index=self.layer_index,
             queries_per_kv=self.queries_per_kv,
             grouped=metadata.backend == "triton-grouped",
+            autotune=metadata.backend == "triton",
         )
 
     @staticmethod

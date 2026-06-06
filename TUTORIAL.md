@@ -2042,10 +2042,166 @@ Amdahl 定律在推理系统中的直接体现。
 - 把 K/V 写回也改成专门 Triton Kernel，避免 `torch.stack` 临时 Tensor
 - 更长上下文下 GQA 分组和 Split-K 是否开始有收益
 
+### 2026-06-06：第 10C 步，常驻 BlockTable 与带保护的 Kernel Autotune
+
+10B 已经测得 BlockTable 元数据约几十微秒，远小于旧 K/V 写回，但它仍存在两个系统
+问题：
+
+- 每轮 Decode 创建新的 CUDA BlockTable Tensor
+- Kernel 固定使用 `num_warps=4`，没有根据形状选择配置
+
+10C 把这两项补齐，同时保留严格 A/B 路径验证真实收益。
+
+#### 1. 常驻 GPU Workspace 的结构
+
+`PagedAttentionWorkspace` 在 Engine 初始化时一次性分配：
+
+```text
+CPU block_tables      [max_num_seqs, num_kv_blocks] int32
+CPU context_lengths   [max_num_seqs]                 int32
+GPU block_tables      [max_num_seqs, num_kv_blocks] int32
+GPU context_lengths   [max_num_seqs]                 int32
+```
+
+每轮返回的不是新 Tensor，而是有效区域的视图：
+
+```text
+gpu_block_tables[:batch_size, :max_blocks]
+gpu_context_lengths[:batch_size]
+```
+
+测试会记录 `data_ptr()`，多次更新请求顺序、长度和物理块后，GPU Workspace 地址保持
+不变。这说明 CUDA allocator 不再参与每轮 BlockTable 生命周期。
+
+#### 2. 为什么不能逐格写预分配 Tensor
+
+第一版 Workspace 对 Python tuple 做双重循环：
+
+```python
+for row, table in enumerate(tables):
+    for column, block_id in enumerate(table.physical_block_ids):
+        cpu_workspace[row, column] = block_id
+```
+
+微基准反而从瞬时路径的约 `55 us` 变成 `135 us`。预分配只消除了 allocator，却引入
+大量 Python 标量赋值。常驻不自动等于更快。
+
+最终实现缓存每一行上次的 `physical_block_ids`：
+
+```text
+Block 映射不变：不上传该行
+跨 Block 边界：更新 CPU 行，并覆盖 GPU 有效切片
+Batch 重排：只更新发生变化的行
+```
+
+普通 Decode 每轮只增加 `num_tokens`，物理块通常连续十几轮都不变化，因此 BlockTable
+真正变成长期驻留数据。
+
+#### 3. 复用 position_ids 作为 context length
+
+Decode 的 RoPE 位置就是历史长度：
+
+```text
+position_id = block_table.num_tokens = context_length
+```
+
+旧数据流为同一组整数创建两份 GPU Tensor：
+
+```text
+position_ids       -> RoPE
+context_lengths    -> Paged Attention
+```
+
+现在 Engine 只上传 `position_ids`，并把 `position_ids[:, 0]` 直接交给 Triton Kernel。
+BlockTable 映射未变化时，Paged Attention 不再额外上传任何元数据。
+
+#### 4. Workspace 为什么没有明显提高整模型吞吐
+
+变化长度微基准中，增量 Workspace 曾把独立元数据操作从约 `56.8 us` 降到 `46.6 us`。
+继续把 position/context 合并后，整条 Engine 路径的主要成本变成原本就需要的
+`position_ids` 创建和上传；BlockTable 是否瞬时创建的差距已经很小。
+
+最终五次迭代结果：
+
+```text
+瞬时 BlockTable + 4 warps   87.00 tokens/s
+常驻 BlockTable + 4 warps   86.09 tokens/s
+```
+
+另一轮为 `83.72 vs 84.71 tokens/s`。方向会随系统噪声变化，合理结论是端到端基本持平，
+而不是宣称 1% 的不稳定加速。
+
+常驻 Workspace 的当前价值主要是：
+
+- CUDA Tensor 地址稳定
+- 避免高并发服务中持续的小对象分配
+- 为 CUDA Graph 捕获准备固定地址
+- 为后续增量 GPU BlockTable 更新建立接口
+
+#### 5. Autotune 如何工作
+
+首次遇到新的形状 key：
+
+```text
+(device, dtype, batch, query_heads, head_dim, block_size, max_blocks)
+```
+
+启动器依次测试：
+
+```text
+num_warps = 1, 2, 4, 8
+```
+
+每个候选使用 20 次 warmup 和 100 次正式测量，并取 median。结果保存在 Python 进程内，
+后续 28 层和后续 Decode 轮直接复用选择；Triton 编译产物仍由磁盘 JIT Cache 保存。
+
+`triton-fixed` 后端始终使用 4 warps，专门用于 A/B。
+
+#### 6. 为什么需要 10% 基线保护
+
+最初直接选择微基准最快配置时，候选只比 4 warps 快约 0.6% 到 3%，但端到端吞吐反而
+下降约 2%。RTX 4060 Ti 在 Windows WDDM 下会受到频率、缓存和调度抖动影响，十几微秒
+Kernel 的微小差距不够可靠。
+
+因此最终规则是：
+
+```text
+候选延迟 <= 4-warps 延迟 * 0.90：采用候选
+否则：继续使用 4 warps
+```
+
+标准工作负载中，微基准经常认为 1 warp 略快，但没有达到 10% 门槛，保护后统一选择
+4 warps。最终：
+
+```text
+常驻 + 固定 4 warps    86.09 tokens/s
+常驻 + 保护 autotune   85.97 tokens/s
+```
+
+两者基本一致，说明 autotune 没有制造回退。对于更长上下文或不同 GPU，如果某个候选
+优势足够明确，它仍然可以自动生效。
+
+#### 7. 最终标准 Benchmark
+
+| 路径 | 总输出吞吐 | 峰值显存 |
+|---|---:|---:|
+| Gather + SDPA | 63.63 tokens/s | 4026.4 MiB |
+| 瞬时 BlockTable + 4 warps | 87.00 tokens/s | 4008.2 MiB |
+| 常驻 BlockTable + 4 warps | 86.09 tokens/s | 4008.2 MiB |
+| 常驻 BlockTable + 保护 autotune | 85.97 tokens/s | 4008.2 MiB |
+
+10C 没有得到新的显著吞吐倍数，但完成了生产推理引擎很重要的两类基础设施：
+
+- 固定地址、增量更新的 GPU 调度元数据
+- 可观察、有基线保护、不会强行采用噪声赢家的 Kernel 配置选择
+
+下一步更值得测量的是 CUDA Graph：Workspace 地址稳定后，可以尝试捕获固定 Batch
+形状的一整个 Decode 前向，减少 28 层模型中大量 Kernel 的 Python launch 开销。
+
 ### 当前验证结果
 
 ```text
-53 个测试全部通过
+54 个测试全部通过
 Python compileall 通过
 CUDA、BF16、真实权重加载通过
 Tokenizer 普通文本往返和聊天模板测试通过
@@ -2062,6 +2218,8 @@ Paged Decode 已验证不会调用 read_batch Gather
 Triton 与 PyTorch Paged Attention 在不同长度 Batch 上对齐
 真实 Qwen3-1.7B BF16 Triton 推理通过
 向量化 Decode K/V 写回与逐项参考实现对齐
+常驻 BlockTable Workspace 多轮更新地址稳定
+Triton autotune 四组候选、缓存和基线保护通过
 多种上下文长度的 benchmark 已写入 benchmarks/results.jsonl
 ```
 
@@ -2084,5 +2242,6 @@ Triton 与 PyTorch Paged Attention 在不同长度 Batch 上对齐
 - [ ] 第 10 步：性能测量与优化
   - [x] 第 10A 步：Triton 单 token Paged Attention
   - [x] 第 10B 步：GQA 实验与向量化 Decode K/V 写回
-  - [ ] 第 10C 步：BlockTable 常驻 GPU 与 Kernel autotune
+  - [x] 第 10C 步：BlockTable 常驻 GPU 与 Kernel autotune
+  - [ ] 第 10D 步：固定 Batch Decode 的 CUDA Graph 实验
 - [ ] 第 11 步：HTTP 服务（可选）

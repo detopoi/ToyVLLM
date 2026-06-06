@@ -4,7 +4,11 @@ import torch
 
 from toyvllm.block_manager import BlockManager
 from toyvllm.kv_cache import PagedKVCache
-from toyvllm.kernels.paged_attention import is_triton_available
+from toyvllm.kernels.paged_attention import (
+    clear_triton_autotune_cache,
+    get_triton_autotune_results,
+    is_triton_available,
+)
 from toyvllm.layers.attention import Qwen3Attention
 
 
@@ -89,6 +93,7 @@ class PagedAttentionTest(unittest.TestCase):
             head_dim=8,
             dtype=torch.float32,
             device=device,
+            max_num_seqs=2,
         )
         first_key = torch.randn(1, 2, 3, 8, device=device)
         first_value = torch.randn(1, 2, 3, 8, device=device)
@@ -106,7 +111,8 @@ class PagedAttentionTest(unittest.TestCase):
             ),
             use_cache=True,
         )
-        for backend in ("triton", "triton-grouped"):
+        clear_triton_autotune_cache()
+        for backend in ("triton-fixed", "triton", "triton-grouped"):
             actual, _ = attention(
                 hidden_states,
                 paged_attention=cache.attention_metadata(
@@ -122,6 +128,14 @@ class PagedAttentionTest(unittest.TestCase):
                 atol=1e-4,
                 rtol=1e-4,
             )
+        tune_results = get_triton_autotune_results()
+        self.assertEqual(len(tune_results), 1)
+        selected = next(iter(tune_results.values()))
+        self.assertIn(selected["num_warps"], (1, 2, 4, 8))
+        self.assertEqual(
+            set(selected["timings_ms"]),
+            {1, 2, 4, 8},
+        )
 
 
 if __name__ == "__main__":

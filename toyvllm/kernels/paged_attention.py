@@ -26,6 +26,35 @@ def is_triton_available() -> bool:
     return triton is not None
 
 
+_AUTOTUNE_NUM_WARPS = (1, 2, 4, 8)
+_AUTOTUNE_MIN_IMPROVEMENT = 0.10
+_AUTOTUNE_CACHE: dict[tuple[object, ...], int] = {}
+_AUTOTUNE_TIMINGS: dict[tuple[object, ...], dict[int, float]] = {}
+
+
+def clear_triton_autotune_cache() -> None:
+    """清除 Python 进程内的配置选择；已编译二进制仍由 Triton 磁盘缓存管理。"""
+
+    _AUTOTUNE_CACHE.clear()
+    _AUTOTUNE_TIMINGS.clear()
+
+
+def get_triton_autotune_results() -> dict[tuple[object, ...], dict[str, object]]:
+    """返回调优结果副本，供 benchmark 和教程观察。"""
+
+    return {
+        key: {
+            "num_warps": _AUTOTUNE_CACHE[key],
+            "fastest_num_warps": min(
+                _AUTOTUNE_TIMINGS[key],
+                key=_AUTOTUNE_TIMINGS[key].get,
+            ),
+            "timings_ms": dict(_AUTOTUNE_TIMINGS[key]),
+        }
+        for key in _AUTOTUNE_CACHE
+    }
+
+
 if triton is not None:
 
     @triton.jit
@@ -321,6 +350,7 @@ def triton_paged_attention(
     layer_index: int,
     queries_per_kv: int,
     grouped: bool = True,
+    autotune: bool = True,
 ) -> torch.Tensor:
     """启动 Triton Paged Attention。
 
@@ -366,36 +396,78 @@ def triton_paged_attention(
         batch_size,
         num_kv_heads if grouped else num_query_heads,
     )
-    kernel[grid](
-        query,
-        current_key,
-        current_value,
-        key_cache,
-        value_cache,
-        block_tables,
-        context_lengths,
-        output,
-        query.stride(0),
-        query.stride(1),
-        current_key.stride(0),
-        current_key.stride(1),
-        key_cache.stride(0),
-        key_cache.stride(1),
-        key_cache.stride(2),
-        key_cache.stride(3),
-        block_tables.stride(0),
-        output.stride(0),
-        output.stride(1),
-        layer_index=layer_index,
-        **(
-            {"QUERIES_PER_KV": queries_per_kv}
-            if grouped
-            else {"queries_per_kv": queries_per_kv}
-        ),
-        HEAD_DIM=head_dim,
-        BLOCK_SIZE=block_size,
-        MAX_BLOCKS=max_blocks,
-        BLOCK_D=block_d,
-        num_warps=4,
-    )
+    def launch(num_warps: int) -> None:
+        kernel[grid](
+            query,
+            current_key,
+            current_value,
+            key_cache,
+            value_cache,
+            block_tables,
+            context_lengths,
+            output,
+            query.stride(0),
+            query.stride(1),
+            current_key.stride(0),
+            current_key.stride(1),
+            key_cache.stride(0),
+            key_cache.stride(1),
+            key_cache.stride(2),
+            key_cache.stride(3),
+            block_tables.stride(0),
+            output.stride(0),
+            output.stride(1),
+            layer_index=layer_index,
+            **(
+                {"QUERIES_PER_KV": queries_per_kv}
+                if grouped
+                else {"queries_per_kv": queries_per_kv}
+            ),
+            HEAD_DIM=head_dim,
+            BLOCK_SIZE=block_size,
+            MAX_BLOCKS=max_blocks,
+            BLOCK_D=block_d,
+            num_warps=num_warps,
+        )
+
+    num_warps = 4
+    if autotune and not grouped:
+        device_index = query.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        tune_key = (
+            device_index,
+            query.dtype,
+            batch_size,
+            num_query_heads,
+            head_dim,
+            block_size,
+            max_blocks,
+        )
+        if tune_key not in _AUTOTUNE_CACHE:
+            timings = {
+                candidate: float(
+                    triton.testing.do_bench(
+                        lambda candidate=candidate: launch(candidate),
+                        warmup=20,
+                        rep=100,
+                        return_mode="median",
+                    )
+                )
+                for candidate in _AUTOTUNE_NUM_WARPS
+            }
+            _AUTOTUNE_TIMINGS[tune_key] = timings
+            fastest = min(timings, key=timings.get)
+            baseline = timings[4]
+            # 微基准差距太小时容易受缓存、频率和 Windows WDDM 调度噪声影响。
+            # 只有至少快 10% 才替换稳定基线，避免“调优后端到端反而更慢”。
+            _AUTOTUNE_CACHE[tune_key] = (
+                fastest
+                if timings[fastest]
+                <= baseline * (1.0 - _AUTOTUNE_MIN_IMPROVEMENT)
+                else 4
+            )
+        num_warps = _AUTOTUNE_CACHE[tune_key]
+
+    launch(num_warps)
     return output
