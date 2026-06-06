@@ -50,6 +50,7 @@ class BatchGenerationResult:
     step_seconds: list[float]
     first_token_seconds: float
     peak_memory_mib: float
+    completion_seconds: list[float]
 
     @property
     def total_output_tokens(self) -> int:
@@ -206,7 +207,7 @@ def generate_static_batch(
     model: Qwen3ForCausalLM,
     prompt_token_ids: list[list[int]],
     *,
-    max_new_tokens: int,
+    max_new_tokens: int | list[int],
     eos_token_ids: set[int],
     pad_token_id: int,
     sampling_params: SamplingParams | None = None,
@@ -215,12 +216,18 @@ def generate_static_batch(
 
     if not prompt_token_ids or any(not prompt for prompt in prompt_token_ids):
         raise ValueError("batch 和每条 prompt 都不能为空")
-    if max_new_tokens <= 0:
-        raise ValueError("max_new_tokens 必须大于 0")
-
     device = next(model.parameters()).device
     params = sampling_params or SamplingParams()
     batch_size = len(prompt_token_ids)
+    if isinstance(max_new_tokens, int):
+        limits = [max_new_tokens] * batch_size
+    else:
+        limits = list(max_new_tokens)
+        if len(limits) != batch_size:
+            raise ValueError("max_new_tokens 列表长度必须等于 batch size")
+    if any(limit <= 0 for limit in limits):
+        raise ValueError("max_new_tokens 必须大于 0")
+
     generators = create_generators(params, device, batch_size)
     max_prompt_length = max(len(prompt) for prompt in prompt_token_ids)
 
@@ -245,11 +252,13 @@ def generate_static_batch(
     finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
     outputs: list[list[int]] = [[] for _ in range(batch_size)]
     step_seconds: list[float] = []
+    completion_seconds = [0.0] * batch_size
+    generation_started = time.perf_counter()
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
-    for _ in range(max_new_tokens):
+    for _ in range(max(limits)):
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         started = time.perf_counter()
@@ -275,8 +284,11 @@ def generate_static_batch(
             if finished[index]:
                 continue
             outputs[index].append(token)
-            if token in eos_token_ids:
+            if token in eos_token_ids or len(outputs[index]) >= limits[index]:
                 finished[index] = True
+                completion_seconds[index] = (
+                    time.perf_counter() - generation_started
+                )
 
         if bool(finished.all()):
             break
@@ -309,4 +321,5 @@ def generate_static_batch(
         step_seconds=step_seconds,
         first_token_seconds=step_seconds[0],
         peak_memory_mib=peak_memory_mib,
+        completion_seconds=completion_seconds,
     )

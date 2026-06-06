@@ -818,10 +818,257 @@ Batch 从 1 增至 4 后，总输出吞吐提高约 4.03 倍，而一轮 decode 
 - 每条请求独立遇到 EOS 并停止追加输出
 - padding query 不产生 NaN
 
+### 2026-06-06：完成第 8 步，连续批处理与 Scheduler
+
+这一阶段需要先区分两个经常被混在一起的概念：
+
+```text
+Scheduler：决定本轮哪些请求运行
+Executor：把这些请求转换成 Tensor，并执行模型
+```
+
+Scheduler 本身不负责矩阵乘法，也不应该知道 KV Cache 是连续 Tensor 还是分页 Block。
+这种边界让下一阶段替换缓存布局时，不必重写请求状态机。
+
+#### 为什么需要 Scheduler
+
+假设一个静态 batch 中有四条请求：
+
+```text
+请求 A：生成 4 token
+请求 B：生成 16 token
+请求 C：生成 4 token
+请求 D：生成 16 token
+```
+
+第 4 轮后 A、C 已结束，但静态 batch 的形状仍是 4。直到 B、D 完成前，A、C 的槽位只能
+填 pad，不能放入等待中的新请求。
+
+连续批处理希望做到：
+
+```text
+第 4 轮：
+A、C 完成
+  ↓ 立即释放两个槽位
+等待队列中的 E、F 进入
+  ↓
+下一批 GPU 工作变成 [B, D, E, F]
+```
+
+它优化的是整个请求流，而不是单独某一条序列。
+
+#### Sequence：请求的状态载体
+
+`sequence.py` 中每条请求保存：
+
+- `request_id`
+- prompt token
+- 已生成 token
+- 最大生成长度
+- EOS token
+- SamplingParams
+- 当前状态
+- 进入运行和完成时的调度轮次
+- 完成原因
+
+状态只有三种：
+
+```text
+                 有空闲槽位
+WAITING  -------------------------->  RUNNING
+                                          |
+                                          | EOS 或达到 max_new_tokens
+                                          v
+                                      FINISHED
+```
+
+状态转换只能单向发生。FINISHED 请求不会重新回到 RUNNING，这让缓存释放和完成回调更容易
+推理，也能尽早暴露重复调度同一请求的错误。
+
+#### 三个队列
+
+教学版 Scheduler 内部维护：
+
+```text
+waiting  : deque，尚未获得运行槽位
+running  : 有 KV Cache、每轮可以生成 token
+finished : 已完成，用于返回最终结果
+```
+
+`waiting` 使用 FIFO：
+
+```text
+先到的请求先获得空槽
+```
+
+FIFO 很容易理解，也能避免后来的短请求不断插队导致旧请求饥饿。它不是所有场景的最优策略：
+生产系统还可能考虑请求优先级、prompt 长度、SLA、剩余 token 估计或抢占，但应先建立一个
+行为明确且不会饿死请求的基线。
+
+#### 一个调度轮次做什么
+
+当前 `engine.step()` 的顺序是：
+
+```text
+1. 取出当前所有 RUNNING 请求
+2. 执行一次 decode，每条请求前进一步
+3. 检查 EOS 和长度上限
+4. 把完成请求移到 FINISHED，并释放 KV Cache
+5. 按 FIFO 从 WAITING 填满空闲槽位
+6. 对新进入 RUNNING 的请求执行 prefill，生成首 token
+```
+
+所以一个轮次最多会执行两次模型调用：
+
+```text
+一次 decode：服务原有 running 请求
+一次 prefill：服务刚被接纳的新请求
+```
+
+这样做的优点是语义清晰：decode 不会因为新 prompt 很长而被拼成难以理解的混合 Tensor。
+生产级引擎会进一步使用 chunked prefill、token budget 或统一 token packing 平衡首 token
+延迟与 decode 延迟。
+
+#### 容量限制
+
+当前 Scheduler 只有一个容量参数：
+
+```text
+max_num_seqs
+```
+
+它限制同时处于 RUNNING 的请求数量。例如值为 4 时，即使 waiting 中有 100 条请求，
+也最多同时维护 4 条请求的 KV Cache。
+
+仅限制请求数还不够构成生产级显存保护。四条 100-token 请求和四条 10000-token 请求的
+KV Cache 大小差异巨大。完整 vLLM Scheduler 还需要根据可用 KV Block、每轮 token budget
+和最大模型长度决定能否接纳请求。Paged KV Cache 完成后才能可靠加入这些资源约束。
+
+#### 在线请求到达
+
+除了一次性 `run()`，引擎还暴露 `step()`：
+
+```python
+engine.add_request(first_prompt, ...)
+engine.step()
+
+# 模拟服务运行过程中收到新请求
+engine.add_request(second_prompt, ...)
+engine.step()
+```
+
+第二条请求先进入 waiting。下一轮如果有空槽，就会被接纳并 prefill。HTTP 服务以后只需要
+在事件循环中不断接收请求、调用 `step()`、返回新 token，而不必改变 Scheduler 状态机。
+
+#### 不同长度 KV Cache 如何组成动态 Batch
+
+每条请求的紧凑 KV Cache 长度不同：
+
+```text
+A: [heads, 100, head_dim]
+B: [heads, 137, head_dim]
+C: [heads,  52, head_dim]
+```
+
+PyTorch 的普通 batch Tensor 必须是矩形。当前 Executor 每轮找到最大长度 137，左侧补零：
+
+```text
+A: [37 pad | 100 valid]
+B: [         137 valid]
+C: [85 pad |  52 valid]
+```
+
+Attention mask 屏蔽 pad。模型返回后，再按 mask 把每行拆回紧凑缓存。
+
+这保证数学结果正确，但代价很高：
+
+- 28 层都要创建 padding Tensor
+- 每轮都要 `torch.cat`
+- 每轮都要把 batch cache 拆回独立请求
+- 请求加入或退出时持续发生显存分配与复制
+
+Scheduler 决定了“应该动态重组 batch”，但连续 Tensor 布局让重组本身很昂贵。
+
+#### 正确性与公平性验证
+
+测试覆盖：
+
+- WAITING → RUNNING → FINISHED 单向状态转换
+- FIFO admission
+- 请求结束后槽位立即复用
+- EOS 和长度上限都能结束请求
+- running 数量永远不超过 `max_num_seqs`
+- 连续批处理输出与逐条 cached 输出一致
+- 短请求先完成，后续 waiting 请求提前进入
+- 可以在两个 `step()` 之间添加在线请求
+
+一个 tiny model 的调度轨迹为：
+
+```text
+step=00  decode=[]       prefill=[0, 1]
+step=01  decode=[0, 1]   prefill=[2]
+step=02  decode=[1, 2]   prefill=[]
+```
+
+请求 0 在 step 1 完成，请求 2 同一轮获得空槽。它不必等请求 1 完成。
+
+真实模型可以这样查看轨迹：
+
+```powershell
+& $PYTHON -m toyvllm continuous --max-num-seqs 2 --show-schedule `
+    "你好" "解释 KV Cache" "描述夏天" "什么是 GPU"
+```
+
+#### Benchmark：结果为什么暂时变差
+
+测试工作负载：
+
+```text
+请求数       8
+最大并发     4
+prompt       每条 18 token
+生成上限     [4, 16, 4, 16, 4, 16, 4, 16]
+解码         greedy
+warmup       1
+iterations   3
+```
+
+结果：
+
+| 模式 | 总输出吞吐 | 平均请求完成延迟 | 峰值显存 |
+|---|---:|---:|---:|
+| 静态 batch | 65.51 tokens/s | 688.88 ms | 3915.2 MiB |
+| 连续 batch | 54.86 tokens/s | 790.42 ms | 3939.8 MiB |
+
+连续模式只有静态吞吐的约 0.84 倍，平均请求延迟也更高。这不是 Scheduler 没有回收槽位，
+而是当前 Executor 每轮 pack/unpack KV Cache 的成本超过了减少空槽带来的收益。
+
+这个结果说明：
+
+```text
+好的调度策略 + 不适合动态增长的缓存布局
+不等于
+高性能推理引擎
+```
+
+静态 batch 虽然浪费短请求槽位，但整个 KV Tensor 保持连续，GPU 可以反复在稳定形状上计算。
+当前连续引擎减少了一部分无效计算，却增加了大量显存复制、分配和 Python 循环。
+
+因此，Scheduler 阶段的成果主要是：
+
+- 请求生命周期已经正确
+- 动态 admission 已经正确
+- FIFO 公平性已经建立
+- 在线 arrival 接口已经建立
+- 性能瓶颈被明确定位到 KV Cache 数据结构
+
+下一阶段 Paged KV Cache 的目标，不只是“再加一个功能”，而是让每条请求通过 block table
+引用固定物理块。请求加入、增长和退出时只修改 block 映射，不再每轮搬动整段历史缓存。
+
 ### 当前验证结果
 
 ```text
-29 个测试全部通过
+34 个测试全部通过
 Python compileall 通过
 CUDA、BF16、真实权重加载通过
 Tokenizer 普通文本往返和聊天模板测试通过
@@ -830,6 +1077,7 @@ Tokenizer 普通文本往返和聊天模板测试通过
 Naive 与 cached 生成结果一致
 Greedy 与 sampling 均可运行，采样结果可复现
 不同长度静态 batch 与逐请求结果一致
+Scheduler 状态转换、FIFO、在线 arrival 和动态 admission 通过
 多种上下文长度的 benchmark 已写入 benchmarks/results.jsonl
 ```
 
@@ -844,7 +1092,7 @@ Greedy 与 sampling 均可运行，采样结果可复现
 - [x] 第 5 步：连续 KV Cache
 - [x] 第 6 步：采样策略
 - [x] 第 7 步：静态批处理
-- [ ] 第 8 步：连续批处理与调度器
+- [x] 第 8 步：连续批处理与调度器
 - [ ] 第 9 步：Paged KV Cache
 - [ ] 第 10 步：性能测量与优化
 - [ ] 第 11 步：HTTP 服务（可选）

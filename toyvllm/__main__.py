@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 
 from toyvllm.config import ModelConfig
+from toyvllm.engine import ContinuousBatchEngine
 from toyvllm.environment import inspect_environment
 from toyvllm.generation import (
     generate_greedy_cached,
@@ -110,6 +111,25 @@ def build_parser() -> argparse.ArgumentParser:
     batch_parser.add_argument("--max-new-tokens", type=int, default=16)
     batch_parser.add_argument("--thinking", action="store_true")
     add_sampling_arguments(batch_parser)
+
+    continuous_parser = subparsers.add_parser(
+        "continuous",
+        help="运行带 FIFO Scheduler 的连续批处理",
+    )
+    continuous_parser.add_argument(
+        "prompts",
+        nargs="+",
+        help="提交到 waiting 队列的一条或多条 prompt",
+    )
+    continuous_parser.add_argument("--max-new-tokens", type=int, default=16)
+    continuous_parser.add_argument("--max-num-seqs", type=int, default=4)
+    continuous_parser.add_argument("--thinking", action="store_true")
+    continuous_parser.add_argument(
+        "--show-schedule",
+        action="store_true",
+        help="打印每轮 decode/prefill 的 request id",
+    )
+    add_sampling_arguments(continuous_parser)
     return parser
 
 
@@ -205,6 +225,58 @@ def main() -> None:
         for index, token_ids in enumerate(result.output_token_ids):
             print(f"\n[{index}] {args.prompts[index]}")
             print(tokenizer.decode(token_ids, skip_special_tokens=True))
+        return
+
+    if args.command == "continuous":
+        config = ModelConfig.from_pretrained(args.model)
+        tokenizer = Tokenizer(args.model)
+        sampling_params = resolve_sampling_params(args, config)
+        loaded = load_model(config, device="cuda")
+        engine = ContinuousBatchEngine(
+            loaded.model,
+            max_num_seqs=args.max_num_seqs,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+        for prompt in args.prompts:
+            prompt_ids = tokenizer.encode_chat(
+                [{"role": "user", "content": prompt}],
+                enable_thinking=args.thinking,
+            )
+            engine.add_request(
+                prompt_ids,
+                max_new_tokens=args.max_new_tokens,
+                eos_token_ids=set(config.generation_eos_token_ids),
+                sampling_params=sampling_params,
+            )
+        result = engine.run()
+
+        print(f"模型加载：{loaded.load_seconds:.2f} s")
+        print(f"请求数：{len(args.prompts)}")
+        print(f"最大并发：{args.max_num_seqs}")
+        print(f"解码策略：{format_sampling_params(sampling_params)}")
+        print(f"调度轮数：{len(result.iterations)}")
+        print(f"总输出吞吐：{result.output_tokens_per_second:.2f} tokens/s")
+        print(f"请求吞吐：{result.requests_per_second:.2f} requests/s")
+        print(f"完成顺序：{list(result.completion_order)}")
+        print(f"峰值显存：{result.peak_memory_mib:.1f} MiB")
+
+        if args.show_schedule:
+            print("\n调度轨迹：")
+            for iteration in result.iterations:
+                print(
+                    f"step={iteration.step:02d} "
+                    f"decode={list(iteration.decode_request_ids)} "
+                    f"prefill={list(iteration.prefill_request_ids)}"
+                )
+
+        for sequence in result.sequences:
+            print(f"\n[{sequence.request_id}] {args.prompts[sequence.request_id]}")
+            print(
+                tokenizer.decode(
+                    sequence.output_token_ids,
+                    skip_special_tokens=True,
+                )
+            )
 
 
 if __name__ == "__main__":
