@@ -6,9 +6,11 @@ import statistics
 from toyvllm.benchmark import append_record, append_result, benchmark
 from toyvllm.config import ModelConfig
 from toyvllm.generation import (
+    BatchGenerationResult,
     GenerationResult,
     generate_greedy_cached,
     generate_greedy_naive,
+    generate_static_batch,
 )
 from toyvllm.sampling import SamplingParams
 from toyvllm.tokenizer import ChatMessage, Tokenizer
@@ -20,7 +22,7 @@ def main() -> None:
     parser.add_argument("--model", default="Qwen3-1.7B")
     parser.add_argument(
         "--backend",
-        choices=("tokenizer", "naive", "cached"),
+        choices=("tokenizer", "naive", "cached", "static"),
         default="tokenizer",
     )
     parser.add_argument("--warmup", type=int, default=None)
@@ -38,7 +40,8 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--top-p", type=float, default=None)
-    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
         "--save",
         default=None,
@@ -47,6 +50,9 @@ def main() -> None:
     args = parser.parse_args()
 
     tokenizer = Tokenizer(args.model)
+    if args.backend == "static":
+        run_static_batch_benchmark(args, tokenizer)
+        return
     if args.backend in {"naive", "cached"}:
         run_generation_benchmark(args, tokenizer)
         return
@@ -74,7 +80,103 @@ def main() -> None:
             metadata={"model": args.model, "text_tokens": token_count},
         )
         print(f"\n结果已追加到：{args.save}")
-    print("\n模型推理 benchmark：python bench.py --backend naive")
+    print("\n模型推理 benchmark：python bench.py --backend cached")
+
+
+def resolve_sampling_params(
+    args: argparse.Namespace,
+    config: ModelConfig,
+) -> SamplingParams:
+    requested = args.sample or any(
+        value is not None
+        for value in (args.temperature, args.top_k, args.top_p, args.seed)
+    )
+    if not requested:
+        return SamplingParams()
+    return SamplingParams(
+        temperature=(
+            config.generation_temperature
+            if args.temperature is None
+            else args.temperature
+        ),
+        top_k=config.generation_top_k if args.top_k is None else args.top_k,
+        top_p=config.generation_top_p if args.top_p is None else args.top_p,
+        seed=args.seed,
+    )
+
+
+def run_static_batch_benchmark(
+    args: argparse.Namespace,
+    tokenizer: Tokenizer,
+) -> None:
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size 必须大于 0")
+    warmup = 1 if args.warmup is None else args.warmup
+    iterations = 3 if args.iterations is None else args.iterations
+    label = args.label or f"stage-07-static-batch-{args.batch_size}"
+    config = ModelConfig.from_pretrained(args.model)
+    prompt_ids = tokenizer.encode_chat(
+        [{"role": "user", "content": args.prompt}],
+        enable_thinking=False,
+    )
+    prompts = [prompt_ids] * args.batch_size
+    loaded = load_model(config, device="cuda")
+
+    sampling_params = resolve_sampling_params(args, config)
+
+    def generate() -> BatchGenerationResult:
+        return generate_static_batch(
+            loaded.model,
+            prompts,
+            max_new_tokens=args.max_new_tokens,
+            eos_token_ids=set(config.generation_eos_token_ids),
+            pad_token_id=tokenizer.pad_token_id,
+            sampling_params=sampling_params,
+        )
+
+    for _ in range(warmup):
+        generate()
+    results = [generate() for _ in range(iterations)]
+    total_tokens = sum(result.total_output_tokens for result in results)
+    total_seconds = sum(sum(result.step_seconds) for result in results)
+    total_requests = args.batch_size * iterations
+    strategy = "greedy" if sampling_params.is_greedy else "sampling"
+    metrics = {
+        "backend": "static",
+        "batch_size": args.batch_size,
+        "iterations": iterations,
+        "mean_ttft_ms": statistics.fmean(result.ttft_ms for result in results),
+        "mean_tpot_ms": statistics.fmean(result.tpot_ms for result in results),
+        "output_tokens_per_second": total_tokens / total_seconds,
+        "requests_per_second": total_requests / total_seconds,
+        "peak_memory_mib": max(result.peak_memory_mib for result in results),
+        "model_load_seconds": loaded.load_seconds,
+    }
+
+    print(f"Static batch {strategy} generation")
+    print(f"  Batch size : {args.batch_size}")
+    print(f"  模型加载   : {metrics['model_load_seconds']:.2f} s")
+    print(f"  平均 TTFT  : {metrics['mean_ttft_ms']:.2f} ms")
+    print(f"  每轮 TPOT  : {metrics['mean_tpot_ms']:.2f} ms")
+    print(f"  总输出吞吐 : {metrics['output_tokens_per_second']:.2f} tokens/s")
+    print(f"  请求吞吐   : {metrics['requests_per_second']:.2f} requests/s")
+    print(f"  峰值显存   : {metrics['peak_memory_mib']:.1f} MiB")
+
+    if args.save:
+        append_record(
+            args.save,
+            label=label,
+            metrics=metrics,
+            metadata={
+                "model": args.model,
+                "prompt": args.prompt,
+                "prompt_tokens": len(prompt_ids),
+                "max_new_tokens": args.max_new_tokens,
+                "warmup": warmup,
+                "decoding": strategy,
+            },
+        )
+        print(f"\n结果已追加到：{args.save}")
 
 
 def run_generation_benchmark(
@@ -83,15 +185,6 @@ def run_generation_benchmark(
 ) -> None:
     warmup = 1 if args.warmup is None else args.warmup
     iterations = 3 if args.iterations is None else args.iterations
-    label = args.label or (
-        "stage-06-sampling"
-        if args.sample
-        else (
-            "stage-05-kv-cache"
-            if args.backend == "cached"
-            else "stage-04-naive"
-        )
-    )
     config = ModelConfig.from_pretrained(args.model)
     if args.prompt_repeat <= 0:
         raise ValueError("--prompt-repeat 必须大于 0")
@@ -99,23 +192,15 @@ def run_generation_benchmark(
     messages: list[ChatMessage] = [{"role": "user", "content": prompt_text}]
     prompt_token_ids = tokenizer.encode_chat(messages, enable_thinking=False)
     loaded = load_model(config, device="cuda")
-    sampling_params = SamplingParams(
-        temperature=(
-            config.generation_temperature
-            if args.sample and args.temperature is None
-            else (args.temperature or 0.0)
-        ),
-        top_k=(
-            config.generation_top_k
-            if args.sample and args.top_k is None
-            else (args.top_k or 0)
-        ),
-        top_p=(
-            config.generation_top_p
-            if args.sample and args.top_p is None
-            else (1.0 if args.top_p is None else args.top_p)
-        ),
-        seed=args.seed if args.sample else None,
+    sampling_params = resolve_sampling_params(args, config)
+    label = args.label or (
+        "stage-06-sampling"
+        if not sampling_params.is_greedy
+        else (
+            "stage-05-kv-cache"
+            if args.backend == "cached"
+            else "stage-04-naive"
+        )
     )
     generate_function = (
         generate_greedy_cached

@@ -689,10 +689,139 @@ top_p       = 0.95
 - 相同 seed 可复现采样序列
 - Naive 和 cached 后端在相同 seed 下输出一致
 
+采样超参数可以在启动时分别指定，不要求一定使用 `--sample`：
+
+```powershell
+& $PYTHON -m toyvllm generate `
+    --temperature 0.8 `
+    --top-k 40 `
+    --top-p 0.9 `
+    --seed 123 `
+    "写一句关于夜空的短句。"
+```
+
+只传其中任意一个也会进入采样模式，未指定项使用模型 `generation_config.json` 的默认值。
+例如只传 `--top-k 50` 时，temperature 和 top-p 分别使用 0.6 和 0.95。
+
+### 2026-06-06：完成第 7 步，静态批处理
+
+静态批处理把多条请求放进同一个固定 batch，一次模型前向同时计算多条序列。GPU 的矩阵计算
+通常能从更大的 batch 中获得更高利用率。
+
+#### 不同长度与左 Padding
+
+Tensor 的每一维必须是规则矩形，但 prompt 长度可能不同，例如：
+
+```text
+请求 A: [a1, a2, a3, a4]
+请求 B:         [b1, b2]
+```
+
+当前实现从左侧补 pad：
+
+```text
+input_ids:
+A: [a1,  a2,  a3, a4]
+B: [pad, pad, b1, b2]
+
+attention_mask:
+A: [1, 1, 1, 1]
+B: [0, 0, 1, 1]
+```
+
+使用左 padding 后，每一行的最后位置都是 prompt 的真实末 token，可以统一取最后位置 logits。
+Attention mask 保证真实 token 不会关注 pad。
+
+RoPE 位置不能直接使用 padded 数组下标。请求 B 的 `b1, b2` 应使用位置 `0, 1`，而不是
+`2, 3`。因此位置由下面公式得到：
+
+```text
+position_ids = attention_mask.cumsum(-1) - 1
+```
+
+padding 位置会被截断为 0，真实 token 从 0 递增。
+
+实现时还遇到一个数值边界：padding query 的全部 key 都被屏蔽时，一些 SDPA 后端会返回
+NaN。解决方式是仅让无效 padding query 看到自己的 padding key，保证该行数值有限；
+真实 query 仍然看不到任何 padding key。
+
+#### 批量 KV Cache
+
+每层缓存形状从单请求：
+
+```text
+[1, num_kv_heads, tokens, head_dim]
+```
+
+变为：
+
+```text
+[batch_size, num_kv_heads, tokens, head_dim]
+```
+
+Prefill 一次处理整个 batch。之后每轮 decode 的输入形状是 `[batch_size, 1]`，
+一次前向为每条请求生成一个 token。
+
+每条请求独立检查 EOS。已经结束的请求不再追加输出，但静态 batch 的形状不能缩小，
+它仍要用 pad 占住原来的槽位，直到 batch 中最长请求结束。这是静态批处理的主要浪费，
+也是下一阶段连续批处理要解决的问题。
+
+#### 批量采样
+
+每条请求使用独立随机数生成器。给定基础 seed 时，第 i 条请求使用 `seed+i`。
+这样某条请求不会因为同 batch 中另一条请求多生成一个 token 而改变随机序列，
+第一条请求单独运行或放入 batch 时也能保持结果一致。
+
+运行不同长度请求：
+
+```powershell
+& $PYTHON -m toyvllm batch --max-new-tokens 16 `
+    "你好" `
+    "用一句话解释 KV Cache。" `
+    "请用三个词描述夏天。"
+```
+
+也可以同时独立指定全部采样参数：
+
+```powershell
+& $PYTHON -m toyvllm batch `
+    --temperature 0.7 --top-k 30 --top-p 0.9 --seed 123 `
+    "你好" "介绍 KV Cache。"
+```
+
+真实三请求测试的输入长度为 `[13, 18, 19]`，输出分别保持独立，padding 没有改变结果。
+
+#### Benchmark 结果
+
+固定 18-token prompt、greedy、16 个输出 token、warmup 1、iterations 3：
+
+| Batch size | Batch TTFT | 每轮 TPOT | 总输出吞吐 | 请求吞吐 | 峰值显存 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 38.36 ms | 37.37 ms | 26.71 tokens/s | 1.67 req/s | 3892.1 MiB |
+| 2 | 36.83 ms | 37.34 ms | 53.61 tokens/s | 3.35 req/s | 3899.8 MiB |
+| 4 | 37.81 ms | 37.13 ms | 107.61 tokens/s | 6.73 req/s | 3915.2 MiB |
+
+Batch 从 1 增至 4 后，总输出吞吐提高约 4.03 倍，而一轮 decode 的耗时基本不变。
+这表示 GPU 在相近时间内从一次产出 1 个 token 变成产出 4 个 token。
+
+这里的 TPOT 是整个 batch 完成一轮 decode 的耗时，不是用它除以 batch size 后的单请求
+延迟。静态 batch 提升的是系统总吞吐，单条请求仍约每 37 ms 得到一个 token。
+
+当前测试的 prompt 和输出较短，所以 batch=4 仅比 batch=1 增加约 23 MiB 峰值显存。
+长上下文下，每条请求都要保存独立 KV Cache，显存会随 batch size 和 token 数明显增长。
+
+测试覆盖：
+
+- 左 padding batch 的 logits 与逐条模型前向一致
+- 静态 batch greedy 输出与逐条 cached 输出一致
+- batch 第一条采样流与单请求同 seed 一致
+- 每条请求独立遇到 EOS 并停止追加输出
+- padding query 不产生 NaN
+
 ### 当前验证结果
 
 ```text
-24 个测试全部通过
+29 个测试全部通过
 Python compileall 通过
 CUDA、BF16、真实权重加载通过
 Tokenizer 普通文本往返和聊天模板测试通过
@@ -700,6 +829,7 @@ Tokenizer 普通文本往返和聊天模板测试通过
 真实 Qwen3-1.7B greedy 生成通过
 Naive 与 cached 生成结果一致
 Greedy 与 sampling 均可运行，采样结果可复现
+不同长度静态 batch 与逐请求结果一致
 多种上下文长度的 benchmark 已写入 benchmarks/results.jsonl
 ```
 
@@ -713,7 +843,7 @@ Greedy 与 sampling 均可运行，采样结果可复现
 - [x] 第 4 步：朴素文本生成
 - [x] 第 5 步：连续 KV Cache
 - [x] 第 6 步：采样策略
-- [ ] 第 7 步：静态批处理
+- [x] 第 7 步：静态批处理
 - [ ] 第 8 步：连续批处理与调度器
 - [ ] 第 9 步：Paged KV Cache
 - [ ] 第 10 步：性能测量与优化

@@ -39,6 +39,7 @@ class Qwen3DecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
         past_key_value: KVCache | None = None,
         use_cache: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, KVCache]:
@@ -49,6 +50,7 @@ class Qwen3DecoderLayer(nn.Module):
         attention_output = self.self_attn(
             hidden_states,
             position_ids,
+            attention_mask=attention_mask,
             past_key_value=past_key_value,
             use_cache=use_cache,
         )
@@ -82,6 +84,7 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
         past_key_values: list[KVCache] | None = None,
         use_cache: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]]:
@@ -94,12 +97,18 @@ class Qwen3Model(nn.Module):
         if past_key_values:
             past_length = past_key_values[0][0].shape[2]
         if position_ids is None:
-            sequence_length = input_ids.shape[1]
-            position_ids = torch.arange(
-                past_length,
-                past_length + sequence_length,
-                device=input_ids.device,
-            ).unsqueeze(0).expand(input_ids.shape[0], -1)
+            if attention_mask is not None:
+                # 左 padding 不应占用 RoPE 位置。真实 token 的位置始终从 0 开始。
+                all_position_ids = attention_mask.long().cumsum(dim=-1) - 1
+                all_position_ids.clamp_(min=0)
+                position_ids = all_position_ids[:, -input_ids.shape[1] :]
+            else:
+                sequence_length = input_ids.shape[1]
+                position_ids = torch.arange(
+                    past_length,
+                    past_length + sequence_length,
+                    device=input_ids.device,
+                ).unsqueeze(0).expand(input_ids.shape[0], -1)
 
         hidden_states = self.embed_tokens(input_ids)
         present_key_values: list[KVCache] = []
@@ -110,6 +119,7 @@ class Qwen3Model(nn.Module):
             layer_output = layer(
                 hidden_states,
                 position_ids,
+                attention_mask=attention_mask,
                 past_key_value=layer_past,
                 use_cache=use_cache,
             )
@@ -139,11 +149,15 @@ class Qwen3ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         *,
         last_token_only: bool = True,
+        position_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
         past_key_values: list[KVCache] | None = None,
         use_cache: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]]:
         model_output = self.model(
             input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
         )

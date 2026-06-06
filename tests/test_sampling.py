@@ -5,6 +5,7 @@ import torch
 from toyvllm.sampling import (
     SamplingParams,
     create_generator,
+    create_generators,
     filter_logits,
     sample_next_token,
 )
@@ -58,6 +59,19 @@ class SamplingTest(unittest.TestCase):
             SamplingParams(top_k=-1)
         with self.assertRaises(ValueError):
             SamplingParams(top_p=0)
+
+    def test_batch_generators_use_independent_reproducible_seeds(self) -> None:
+        params = SamplingParams(temperature=1.0, seed=10)
+        generators = create_generators(params, torch.device("cpu"), 2)
+        first = torch.rand(3, generator=generators[0])
+        second = torch.rand(3, generator=generators[1])
+
+        repeated = create_generators(params, torch.device("cpu"), 2)
+        torch.testing.assert_close(
+            first,
+            torch.rand(3, generator=repeated[0]),
+        )
+        self.assertFalse(torch.equal(first, second))
 
 
 if __name__ == "__main__":

@@ -63,6 +63,36 @@ class Qwen3ModelTest(unittest.TestCase):
             rtol=1e-5,
         )
 
+    def test_left_padded_batch_matches_individual_logits(self) -> None:
+        torch.manual_seed(0)
+        model = Qwen3ForCausalLM(tiny_config()).eval()
+        first = torch.tensor([[1, 2, 3, 4]])
+        second = torch.tensor([[5, 6]])
+        first_logits = model(first)
+        second_logits = model(second)
+
+        batch = torch.tensor(
+            [
+                [1, 2, 3, 4],
+                [0, 0, 5, 6],
+            ]
+        )
+        attention_mask = torch.tensor(
+            [
+                [1, 1, 1, 1],
+                [0, 0, 1, 1],
+            ]
+        )
+        batch_logits = model(batch, attention_mask=attention_mask)
+
+        torch.testing.assert_close(batch_logits[0], first_logits[0])
+        torch.testing.assert_close(
+            batch_logits[1],
+            second_logits[0],
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
