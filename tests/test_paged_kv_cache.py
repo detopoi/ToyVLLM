@@ -186,6 +186,47 @@ class PagedKVCacheTest(unittest.TestCase):
         torch.testing.assert_close(self.cache.key_cache, reference_key)
         torch.testing.assert_close(self.cache.value_cache, reference_value)
 
+    def test_attention_workspace_reuses_storage_across_updates(self) -> None:
+        manager = BlockManager(num_blocks=6, block_size=2)
+        first = manager.allocate(10, num_tokens=3)
+        second = manager.allocate(20, num_tokens=1)
+        cache = PagedKVCache(
+            num_layers=1,
+            num_blocks=6,
+            block_size=2,
+            num_kv_heads=2,
+            head_dim=3,
+            dtype=torch.float32,
+            device="cpu",
+            max_num_seqs=2,
+        )
+
+        first_metadata = cache.attention_metadata(
+            (first, second),
+            backend="triton-fixed",
+        )
+        table_pointer = first_metadata.block_table_tensor.data_ptr()
+        length_pointer = first_metadata.context_lengths.data_ptr()
+        self.assertEqual(
+            first_metadata.block_table_tensor.tolist(),
+            [[0, 1], [2, -1]],
+        )
+        self.assertEqual(first_metadata.context_lengths.tolist(), [3, 1])
+
+        manager.reserve(20, 2)
+        second = manager.get_block_table(20)
+        second_metadata = cache.attention_metadata(
+            (second, first),
+            backend="triton-fixed",
+        )
+        self.assertEqual(second_metadata.block_table_tensor.data_ptr(), table_pointer)
+        self.assertEqual(second_metadata.context_lengths.data_ptr(), length_pointer)
+        self.assertEqual(
+            second_metadata.block_table_tensor.tolist(),
+            [[2, 3], [0, 1]],
+        )
+        self.assertEqual(second_metadata.context_lengths.tolist(), [3, 3])
+
 
 if __name__ == "__main__":
     unittest.main()

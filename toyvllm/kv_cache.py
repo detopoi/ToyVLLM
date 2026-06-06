@@ -19,6 +19,102 @@ class PagedKVCacheShape:
     head_dim: int
 
 
+@dataclass
+class PagedAttentionWorkspace:
+    """常驻 CPU/GPU 的 BlockTable 元数据缓冲区。
+
+    GPU Tensor 只在初始化时分配一次。每轮 Decode 更新前 `batch_size` 行和实际使用的
+    Block 列，返回的是 Workspace 的切片视图，不再反复创建新的 CUDA Tensor。
+    """
+
+    cpu_block_tables: torch.Tensor
+    cpu_context_lengths: torch.Tensor
+    gpu_block_tables: torch.Tensor
+    gpu_context_lengths: torch.Tensor
+    row_block_ids: list[tuple[int, ...] | None]
+    context_signature: tuple[int, ...] | None = None
+
+    @classmethod
+    def allocate(
+        cls,
+        *,
+        max_num_seqs: int,
+        max_num_blocks: int,
+        device: torch.device,
+    ) -> PagedAttentionWorkspace:
+        if max_num_seqs <= 0:
+            raise ValueError("max_num_seqs 必须大于 0")
+        shape = (max_num_seqs, max_num_blocks)
+        pin_memory = device.type == "cuda"
+        return cls(
+            cpu_block_tables=torch.empty(
+                shape,
+                dtype=torch.int32,
+                pin_memory=pin_memory,
+            ),
+            cpu_context_lengths=torch.empty(
+                max_num_seqs,
+                dtype=torch.int32,
+                pin_memory=pin_memory,
+            ),
+            gpu_block_tables=torch.empty(shape, dtype=torch.int32, device=device),
+            gpu_context_lengths=torch.empty(
+                max_num_seqs,
+                dtype=torch.int32,
+                device=device,
+            ),
+            row_block_ids=[None] * max_num_seqs,
+        )
+
+    def update(
+        self,
+        tables: tuple[BlockTable, ...],
+        *,
+        context_lengths: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = len(tables)
+        max_blocks = max(table.num_blocks for table in tables)
+        if batch_size > self.gpu_block_tables.shape[0]:
+            raise ValueError("Decode batch 超过 BlockTable Workspace 容量")
+        if max_blocks > self.gpu_block_tables.shape[1]:
+            raise ValueError("请求 BlockTable 超过 Workspace 容量")
+
+        block_table_changed = False
+        for row, table in enumerate(tables):
+            block_ids = table.physical_block_ids
+            if self.row_block_ids[row] != block_ids:
+                cpu_row = self.cpu_block_tables[row]
+                cpu_row.fill_(-1)
+                cpu_row[: len(block_ids)].copy_(
+                    torch.tensor(block_ids, dtype=torch.int32)
+                )
+                self.row_block_ids[row] = block_ids
+                block_table_changed = True
+
+        gpu_tables = self.gpu_block_tables[:batch_size, :max_blocks]
+        gpu_lengths = self.gpu_context_lengths[:batch_size]
+        if block_table_changed:
+            gpu_tables.copy_(
+                self.cpu_block_tables[:batch_size, :max_blocks]
+            )
+
+        if context_lengths is not None:
+            if context_lengths.shape != (batch_size,):
+                raise ValueError("外部 context_lengths 形状必须是 [batch]")
+            if context_lengths.device != gpu_lengths.device:
+                raise ValueError("外部 context_lengths 必须和 Workspace 位于同一设备")
+            gpu_lengths = context_lengths
+        else:
+            context_signature = tuple(table.num_tokens for table in tables)
+            if self.context_signature != context_signature:
+                self.cpu_context_lengths[:batch_size].copy_(
+                    torch.tensor(context_signature, dtype=torch.int32)
+                )
+                gpu_lengths.copy_(self.cpu_context_lengths[:batch_size])
+                self.context_signature = context_signature
+        return gpu_tables, gpu_lengths
+
+
 class PagedKVCache:
     """固定物理块池。
 
@@ -44,6 +140,7 @@ class PagedKVCache:
         head_dim: int,
         dtype: torch.dtype,
         device: torch.device | str,
+        max_num_seqs: int | None = None,
     ) -> None:
         dimensions = {
             "num_layers": num_layers,
@@ -69,6 +166,15 @@ class PagedKVCache:
         # 不再为每条请求反复申请越来越长的 Tensor。
         self.key_cache = torch.empty(cache_shape, dtype=dtype, device=device)
         self.value_cache = torch.empty(cache_shape, dtype=dtype, device=device)
+        self.attention_workspace = (
+            None
+            if max_num_seqs is None
+            else PagedAttentionWorkspace.allocate(
+                max_num_seqs=max_num_seqs,
+                max_num_blocks=num_blocks,
+                device=self.key_cache.device,
+            )
+        )
 
     @property
     def device(self) -> torch.device:
@@ -215,6 +321,8 @@ class PagedKVCache:
         tables: tuple[BlockTable, ...],
         *,
         backend: str = "paged",
+        use_workspace: bool = True,
+        context_lengths: torch.Tensor | None = None,
     ) -> PagedAttentionMetadata:
         """创建不复制 K/V 数据的 Paged Attention 只读视图。
 
@@ -226,33 +334,46 @@ class PagedKVCache:
         for table in tables:
             if table.block_size != self.shape.block_size:
                 raise ValueError("BlockTable 与物理池的 block_size 不一致")
-        if backend not in {"paged", "triton", "triton-grouped"}:
+        if backend not in {
+            "paged",
+            "triton",
+            "triton-fixed",
+            "triton-grouped",
+        }:
             raise ValueError(
-                "Paged Attention backend 必须是 paged、triton "
-                "或 triton-grouped"
+                "Paged Attention backend 必须是 paged、triton、"
+                "triton-fixed 或 triton-grouped"
             )
 
         block_table_tensor = None
         context_lengths = None
-        if backend in {"triton", "triton-grouped"}:
+        if backend in {"triton", "triton-fixed", "triton-grouped"}:
             max_blocks = max(table.num_blocks for table in tables)
-            # -1 只用于补齐二维形状。Kernel 根据 context_lengths 屏蔽这些位置，
-            # 不会读取对应的物理地址。
-            rows = [
-                list(table.physical_block_ids)
-                + [-1] * (max_blocks - table.num_blocks)
-                for table in tables
-            ]
-            block_table_tensor = torch.tensor(
-                rows,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            context_lengths = torch.tensor(
-                [table.num_tokens for table in tables],
-                dtype=torch.int32,
-                device=self.device,
-            )
+            if use_workspace and self.attention_workspace is not None:
+                block_table_tensor, context_lengths = (
+                    self.attention_workspace.update(
+                        tables,
+                        context_lengths=context_lengths,
+                    )
+                )
+            else:
+                # 10A 的瞬时路径保留用于 A/B：每轮新建 CPU 数据并上传为 CUDA Tensor。
+                rows = [
+                    list(table.physical_block_ids)
+                    + [-1] * (max_blocks - table.num_blocks)
+                    for table in tables
+                ]
+                block_table_tensor = torch.tensor(
+                    rows,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                if context_lengths is None:
+                    context_lengths = torch.tensor(
+                        [table.num_tokens for table in tables],
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
         return PagedAttentionMetadata(
             key_cache=self.key_cache,
             value_cache=self.value_cache,

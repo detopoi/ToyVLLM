@@ -514,6 +514,7 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
         block_size: int = 16,
         attention_backend: str = "paged",
         vectorized_decode_write: bool = True,
+        resident_block_tables: bool = True,
     ) -> None:
         super().__init__(
             model,
@@ -534,17 +535,19 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
             head_dim=config.head_dim,
             dtype=parameter.dtype,
             device=parameter.device,
+            max_num_seqs=max_num_seqs,
         )
         if attention_backend not in {
             "auto",
             "gather",
             "paged",
             "triton",
+            "triton-fixed",
             "triton-grouped",
         }:
             raise ValueError(
-                "attention_backend 必须是 auto、gather、paged、triton "
-                "或 triton-grouped"
+                "attention_backend 必须是 auto、gather、paged、triton、"
+                "triton-fixed 或 triton-grouped"
             )
         if attention_backend == "auto":
             from toyvllm.kernels.paged_attention import is_triton_available
@@ -556,6 +559,7 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
             )
         self.attention_backend = attention_backend
         self.vectorized_decode_write = vectorized_decode_write
+        self.resident_block_tables = resident_block_tables
 
         # 父类的 _caches 属于连续 Tensor 后端。分页后端不使用它，
         # 保留空字典仅是为了维持父类初始化契约。
@@ -672,9 +676,18 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
             self.block_manager.get_block_table(sequence.request_id)
             for sequence in sequences
         )
+        position_ids = torch.tensor(
+            [[table.num_tokens] for table in history_tables],
+            dtype=torch.long,
+            device=self.device,
+        )
         paged_attention = self.paged_cache.attention_metadata(
             history_tables,
             backend=self.attention_backend,
+            use_workspace=self.resident_block_tables,
+            # Decode 位置恰好等于历史长度。RoPE 和 Paged Attention 共享这份 GPU 元数据，
+            # 避免为同一组整数分别上传 position_ids 与 context_lengths。
+            context_lengths=position_ids[:, 0],
         )
 
         # 先原子预留写入槽位，避免模型算完后才发现容量不足。Attention 持有的是 reserve
@@ -688,12 +701,6 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
             dtype=torch.long,
             device=self.device,
         )
-        position_ids = torch.tensor(
-            [[table.num_tokens] for table in history_tables],
-            dtype=torch.long,
-            device=self.device,
-        )
-
         started = self._start_timing()
         logits, packed_present = self.model(
             input_ids,

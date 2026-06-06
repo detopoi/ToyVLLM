@@ -149,3 +149,8 @@ Windows 环境安装本项目验证过的 Triton：
 Decode 写回也已向量化：所有请求、全部层的新 token K/V 被整理为
 `[layers, batch, kv_heads, head_dim]`，Key/Value 各一次写入物理池，避免逐请求逐层
 发射大量小写 Kernel。
+
+BlockTable 元数据使用常驻 GPU Workspace：物理块映射只有变化时才覆盖，普通 Decode
+直接复用缓冲区；`position_ids` 同时作为 Attention 的 context length。Triton 会首次
+测试 `num_warps=1/2/4/8`，只有候选比 4-warps 基线快至少 10% 才切换，避免微基准噪声
+让端到端性能回退。
