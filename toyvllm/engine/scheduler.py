@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import deque
 
 from toyvllm.sampling import SamplingParams
-from toyvllm.sequence import FinishReason, Sequence, SequenceStatus
+from toyvllm.engine.sequence import FinishReason, Sequence, SequenceStatus
 
 
 class Scheduler:

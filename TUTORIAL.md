@@ -54,12 +54,14 @@ toyvllm/
 ├── config.py                 # 读取模型配置和引擎配置
 ├── tokenizer.py              # 文本编码、聊天模板和解码
 ├── sampling.py               # greedy、temperature、top-k、top-p
-├── sequence.py               # 一条生成请求的状态
-├── engine.py                 # 推理引擎主循环
-├── scheduler.py              # 请求调度
 ├── kv_cache.py               # KV Cache 存储
-├── block_manager.py          # 分页缓存的块分配
 ├── weight_loader.py          # safetensors 权重加载
+├── engine/
+│   ├── llm_engine.py         # Prefill/Decode 主循环与执行后端
+│   ├── scheduler.py          # 请求调度
+│   ├── sequence.py           # 一条生成请求的状态
+│   ├── block_manager.py      # 分页缓存的块分配
+│   └── __init__.py           # 公共 API 与延迟导出
 ├── models/
 │   └── qwen3.py              # Qwen3 模型结构
 └── layers/
@@ -859,7 +861,7 @@ A、C 完成
 
 #### Sequence：请求的状态载体
 
-`sequence.py` 中每条请求保存：
+`engine/sequence.py` 中每条请求保存：
 
 - `request_id`
 - prompt token
@@ -1138,7 +1140,7 @@ physical_block = block_table[1] = 2
 
 #### BlockManager 管什么
 
-`block_manager.py` 只管理整数物理块号，不持有 K/V Tensor：
+`engine/block_manager.py` 只管理整数物理块号，不持有 K/V Tensor：
 
 ```text
 free blocks   : 当前可分配的物理块编号
@@ -2198,10 +2200,188 @@ Kernel 的微小差距不够可靠。
 下一步更值得测量的是 CUDA Graph：Workspace 地址稳定后，可以尝试捕获固定 Batch
 形状的一整个 Decode 前向，减少 28 层模型中大量 Kernel 的 Python launch 开销。
 
+### 2026-06-11：第 10D 步，长上下文 Serving 吞吐与时延总基线
+
+在继续实现 chunked prefill 之前，先建立一套更接近在线服务的统一基准。否则后面即使
+吞吐发生变化，也无法判断是 Prefill、Decode、调度还是测试口径造成的。
+
+#### 1. 工作负载
+
+```text
+请求数：8
+Prompt token：[128, 256, 512, 768, 128, 256, 512, 768]
+输出上限：[4, 8, 4, 8, 4, 8, 4, 8]
+最大并发 BS：[1, 2, 4, 8]
+迭代：每个配置预热 1 次，正式测量 2 次
+```
+
+Prompt 被 tokenizer 构造成精确 token 长度，不使用 Padding 冒充输入 token。测试关闭
+EOS，让 Gather 和 Triton 完成完全相同数量的生成工作。每个 BS 都单独预热，因为
+Triton JIT/autotune 的缓存 key 包含 Batch 和输入形状；只预热 BS1 会污染较大 BS 的
+首次 TTFT。
+
+#### 2. 新增指标
+
+- `TTFT`：请求进入 Engine 到产生第一个 token 的时间
+- `TPOT`：首 token 之后，每个新增 token 的平均时间
+- `E2E`：请求从进入 Engine 到完成的总时间
+- `total tok/s`：输入 token 与输出 token 的总处理吞吐
+- `out tok/s`：用户真正看到的生成吞吐
+- `prefill step` / `decode step`：定位耗时来自哪一阶段
+
+Engine 为每个请求记录首 token 和完成时刻。分位数使用线性插值实现，不引入 NumPy。
+
+#### 3. RTX 4060 Ti 实测
+
+| 后端 | BS | 总吞吐 tok/s | 输出 tok/s | TTFT P50/P95 ms | TPOT P50/P95 ms | E2E P95 ms | 峰值显存 MiB |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Gather | 1 | 1682.5 | 23.9 | 901.1 / 1709.0 | 37.6 / 44.2 | 1991.4 | 4510.7 |
+| Triton | 1 | 2161.5 | 30.7 | 700.7 / 1361.2 | 27.6 / 30.4 | 1553.6 | 4504.7 |
+| Gather | 2 | 2459.5 | 35.0 | 488.4 / 1099.0 | 43.3 / 63.9 | 1370.4 | 4683.4 |
+| Triton | 2 | 2958.5 | 42.1 | 440.2 / 927.8 | 34.5 / 54.7 | 1115.8 | 4504.7 |
+| Gather | 4 | 2797.6 | 39.8 | 457.3 / 898.4 | 56.4 / 77.0 | 1201.9 | 5035.4 |
+| Triton | 4 | 3416.8 | 48.6 | 435.0 / 774.5 | 39.5 / 57.8 | 986.6 | 4836.5 |
+| Gather | 8 | 2894.0 | 41.1 | 777.5 / 780.2 | 62.4 / 67.6 | 1182.3 | 5729.2 |
+| Triton | 8 | 3460.5 | 49.2 | 777.3 / 777.6 | 28.9 / 29.5 | 983.3 | 5340.5 |
+
+#### 4. 如何读这张表
+
+Triton 在所有 BS 上都比 Gather 更快。以 BS8 为例，总吞吐提高约 `19.6%`，输出吞吐
+也从 `41.1` 提高到 `49.2 tokens/s`，峰值显存少约 `389 MiB`。
+
+但最大吞吐不等于最佳服务体验：
+
+```text
+Triton BS4：TTFT P50 = 435 ms，total = 3417 tok/s
+Triton BS8：TTFT P50 = 777 ms，total = 3460 tok/s
+```
+
+BS 从 4 增加到 8，总吞吐只增加约 `1.3%`，TTFT P50 却增加约 `79%`。原因是当前
+Scheduler 把 8 条不同长度 Prompt 拼成一个完整 Prefill Batch，短 Prompt 也必须等待
+最长的 768-token Prompt 完成。BS8 的 Prefill step 约 `734 ms`，在此期间所有 Decode
+都被阻塞，这就是典型的队头阻塞。
+
+#### 5. 为什么下一步先做 Chunked Prefill
+
+Chunked prefill 给每轮设置 token budget，把长 Prompt 切成多个小块：
+
+```text
+当前：一次处理完整 768-token Prefill，然后恢复 Decode
+分块：每轮只处理一部分 Prefill，并在轮次之间穿插 Decode
+```
+
+它的首要目标不是让单个 Prefill 算得更快，而是限制一次 Prefill 最长占用 GPU 的时间，
+降低已有请求的 TPOT 和新请求的 TTFT 尾延迟。完成分块执行后，再实现 PD 混合调度：
+Scheduler 才能在同一轮 token budget 内决定多少额度给 Prefill、多少给 Decode。
+
+这组结果将作为验收基线。下一阶段重点比较：
+
+- Triton BS8 的 TTFT P50/P95 是否低于当前 `777 ms`
+- Prefill 插入时，运行中请求的 TPOT P95 是否保持稳定
+- 吞吐是否接近当前 `3460 tok/s`，而不是用大幅吞吐下降换延迟
+
+### 2026-06-11：第 10E 步，重构 Engine 子包
+
+在加入 chunked prefill 和 PD 混合调度前，先整理 Engine 的代码边界。原来四个相关模块
+散落在 `toyvllm/` 根目录：
+
+```text
+engine.py
+scheduler.py
+sequence.py
+block_manager.py
+```
+
+其中 `engine.py` 已超过 800 行。后续如果继续直接加入 token budget、Prefill 分块状态和
+混合调度决策，模型执行、请求状态与资源分配会更难区分。
+
+#### 1. 新目录结构
+
+```text
+toyvllm/engine/
+├── llm_engine.py
+├── scheduler.py
+├── sequence.py
+├── block_manager.py
+└── __init__.py
+```
+
+各模块的职责是：
+
+- `sequence.py`：描述单条请求现在处于什么状态，不持有 GPU Tensor
+- `scheduler.py`：决定请求何时从 WAITING 进入 RUNNING，何时完成
+- `block_manager.py`：管理逻辑 token 到物理 KV Block 的映射
+- `llm_engine.py`：把调度结果转换成 Tensor，执行 Prefill/Decode 并管理 GPU 资源
+- `__init__.py`：提供稳定的公共导入入口
+
+调用方仍然使用：
+
+```python
+from toyvllm.engine import (
+    ContinuousBatchEngine,
+    PagedContinuousBatchEngine,
+    Scheduler,
+)
+```
+
+因此这是内部结构重构，不改变 CLI 和已有调用方式。
+
+#### 2. 为什么主文件叫 llm_engine.py
+
+这个命名与 vLLM 的 Engine 层含义一致：它不是模型本身，也不是单独的 Scheduler，而是
+协调请求状态、KV Cache 和模型执行的上层编排器。
+
+当前没有立即把连续缓存和分页缓存拆成两个完全独立的执行器文件。原因是分页实现直接
+继承连续引擎的请求生命周期、采样、计时和 `run/step` 循环。现在强拆会制造大量转发
+接口。等 chunked prefill 明确“执行一个 token chunk”的契约后，再抽出 executor 边界
+更合理。
+
+#### 3. 为什么 __init__.py 使用延迟导出
+
+依赖关系中存在一条环：
+
+```text
+llm_engine -> kv_cache -> engine.block_manager
+```
+
+如果 `engine/__init__.py` 一加载就立即导入 `llm_engine`，那么 `kv_cache` 为了取得
+`BlockTable` 再进入 engine 包时，可能遇到尚未初始化完成的 `llm_engine`。
+
+现在通过模块级 `__getattr__` 按名称延迟加载：
+
+```text
+导入 BlockManager：只加载轻量控制面
+导入 ContinuousBatchEngine：此时才加载模型执行路径
+```
+
+这还带来一个教学和测试上的好处：Scheduler、Sequence、BlockManager 的 CPU 单元测试
+不必顺带导入模型和 CUDA 执行代码。
+
+#### 4. 这次重构的性能影响
+
+没有修改任何 Prefill、Decode、Paged Attention 或 Scheduler 算法，所以预期性能变化
+为零。它的收益是为下一步提供清楚的修改位置：
+
+```text
+Prefill 已处理到哪里        -> Sequence
+本轮 Prefill token budget  -> Scheduler
+Chunk 需要哪些 KV Block    -> BlockManager
+如何执行一个 Prompt chunk  -> LLM Engine
+```
+
+验证结果：
+
+```text
+55 个单元测试通过
+Python compileall 通过
+真实 Qwen3-1.7B Paged Triton 连续批处理通过
+请求结束后 64/64 KV Block 全部回收
+```
+
 ### 当前验证结果
 
 ```text
-54 个测试全部通过
+55 个测试全部通过
 Python compileall 通过
 CUDA、BF16、真实权重加载通过
 Tokenizer 普通文本往返和聊天模板测试通过
@@ -2221,6 +2401,8 @@ Triton 与 PyTorch Paged Attention 在不同长度 Batch 上对齐
 常驻 BlockTable Workspace 多轮更新地址稳定
 Triton autotune 四组候选、缓存和基线保护通过
 多种上下文长度的 benchmark 已写入 benchmarks/results.jsonl
+长上下文 Serving 基准已记录 TTFT、TPOT、E2E、吞吐和显存
+Engine 已迁移到独立子包，公共导入和真实 CUDA 推理保持兼容
 ```
 
 ## 当前进度
@@ -2243,5 +2425,8 @@ Triton autotune 四组候选、缓存和基线保护通过
   - [x] 第 10A 步：Triton 单 token Paged Attention
   - [x] 第 10B 步：GQA 实验与向量化 Decode K/V 写回
   - [x] 第 10C 步：BlockTable 常驻 GPU 与 Kernel autotune
-  - [ ] 第 10D 步：固定 Batch Decode 的 CUDA Graph 实验
+  - [x] 第 10D 步：长上下文 Serving 吞吐与时延总基线
+  - [x] 第 10E 步：Engine 子包重构
+  - [ ] 第 10F 步：Chunked Prefill 与 PD 混合调度
+  - [ ] 第 10G 步：固定 Batch Decode 的 CUDA Graph 实验
 - [ ] 第 11 步：HTTP 服务（可选）

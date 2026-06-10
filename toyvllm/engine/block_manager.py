@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Paged KV Cache 的控制面：管理物理块编号和请求 Block Table。
+"""Engine 的 Paged KV Cache 控制面：管理物理块编号和请求 Block Table。
 
 这里不分配任何 GPU Tensor。BlockManager 只管理“哪些物理块空闲、每条请求引用哪些块”，
 因此可以在 CPU 上完整测试分配策略。真正的 K/V 数据由 kv_cache.py 中的 PagedKVCache 持有。

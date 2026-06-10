@@ -6,7 +6,12 @@ import time
 
 import torch
 
-from toyvllm.benchmark import append_record, append_result, benchmark
+from toyvllm.benchmark import (
+    append_record,
+    append_result,
+    benchmark,
+    percentile,
+)
 from toyvllm.config import ModelConfig
 from toyvllm.engine import (
     ContinuousBatchEngine,
@@ -41,6 +46,7 @@ def main() -> None:
             "static",
             "continuous",
             "paged",
+            "serving",
         ),
         default="tokenizer",
     )
@@ -66,6 +72,16 @@ def main() -> None:
     parser.add_argument("--num-kv-blocks", type=int, default=64)
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument(
+        "--batch-sizes",
+        default="1,2,4,8",
+        help="serving 基准使用的最大并发列表",
+    )
+    parser.add_argument(
+        "--prompt-lengths",
+        default="128,256,512,768",
+        help="serving 基准循环使用的精确 Prompt token 长度",
+    )
+    parser.add_argument(
         "--save",
         default=None,
         help="可选的 JSONL 结果文件，例如 benchmarks/results.jsonl",
@@ -73,6 +89,9 @@ def main() -> None:
     args = parser.parse_args()
 
     tokenizer = Tokenizer(args.model)
+    if args.backend == "serving":
+        run_serving_benchmark(args, tokenizer)
+        return
     if args.backend == "paged":
         run_paged_benchmark(args, tokenizer)
         return
@@ -132,6 +151,255 @@ def resolve_sampling_params(
         top_p=config.generation_top_p if args.top_p is None else args.top_p,
         seed=args.seed,
     )
+
+
+def parse_positive_int_list(value: str, *, name: str) -> list[int]:
+    try:
+        values = [int(item.strip()) for item in value.split(",") if item.strip()]
+    except ValueError as error:
+        raise ValueError(f"{name} 必须是逗号分隔的整数") from error
+    if not values or any(item <= 0 for item in values):
+        raise ValueError(f"{name} 中的值必须全部大于 0")
+    return values
+
+
+def make_exact_length_prompt(
+    tokenizer: Tokenizer,
+    target_length: int,
+    *,
+    variant: int,
+) -> list[int]:
+    """构造可复现、精确长度的合成 Prompt，不把 Padding 计入输入 token。"""
+
+    seed_text = (
+        f"请求{variant}：请分析大模型推理中的 KV Cache、批处理、调度和显存管理。"
+        "回答时关注吞吐、首 token 延迟和每 token 延迟。"
+    )
+    seed_ids = tokenizer.encode(seed_text)
+    if not seed_ids:
+        raise RuntimeError("Tokenizer 没有为基准种子文本产生 token")
+    repeats = (target_length + len(seed_ids) - 1) // len(seed_ids)
+    return (seed_ids * repeats)[:target_length]
+
+
+def summarize_serving_results(
+    results: list[ContinuousBatchResult],
+    *,
+    input_tokens_per_run: int,
+    requests_per_run: int,
+) -> dict[str, float]:
+    """汇总吞吐和请求级时延，固定未来 chunked prefill 的比较口径。"""
+
+    total_seconds = sum(result.total_seconds for result in results)
+    total_input_tokens = input_tokens_per_run * len(results)
+    total_output_tokens = sum(result.total_output_tokens for result in results)
+    ttft_ms = [
+        seconds * 1000
+        for result in results
+        for seconds in result.request_first_token_seconds
+    ]
+    e2e_ms = [
+        seconds * 1000
+        for result in results
+        for seconds in result.request_finish_seconds
+    ]
+    tpot_ms = []
+    for result in results:
+        for sequence, first, finish in zip(
+            result.sequences,
+            result.request_first_token_seconds,
+            result.request_finish_seconds,
+        ):
+            decode_intervals = len(sequence.output_token_ids) - 1
+            if decode_intervals > 0:
+                tpot_ms.append(
+                    (finish - first) * 1000 / decode_intervals
+                )
+    prefill_step_ms = [
+        iteration.prefill_seconds * 1000
+        for result in results
+        for iteration in result.iterations
+        if iteration.prefill_request_ids
+    ]
+    decode_step_ms = [
+        iteration.decode_seconds * 1000
+        for result in results
+        for iteration in result.iterations
+        if iteration.decode_request_ids
+    ]
+    # 只生成 1 个 token 时没有 Decode 间隔，TPOT 和 Decode step 记为 0。
+    # 这样 benchmark 仍可用于纯 Prefill/TTFT 实验。
+    if not tpot_ms:
+        tpot_ms.append(0.0)
+    if not decode_step_ms:
+        decode_step_ms.append(0.0)
+    return {
+        "input_tokens_per_second": total_input_tokens / total_seconds,
+        "output_tokens_per_second": total_output_tokens / total_seconds,
+        "total_tokens_per_second": (
+            total_input_tokens + total_output_tokens
+        ) / total_seconds,
+        "requests_per_second": (
+            requests_per_run * len(results) / total_seconds
+        ),
+        "ttft_mean_ms": statistics.fmean(ttft_ms),
+        "ttft_p50_ms": percentile(ttft_ms, 0.50),
+        "ttft_p95_ms": percentile(ttft_ms, 0.95),
+        "e2e_p50_ms": percentile(e2e_ms, 0.50),
+        "e2e_p95_ms": percentile(e2e_ms, 0.95),
+        "e2e_p99_ms": percentile(e2e_ms, 0.99),
+        "tpot_p50_ms": percentile(tpot_ms, 0.50),
+        "tpot_p95_ms": percentile(tpot_ms, 0.95),
+        "prefill_step_p50_ms": percentile(prefill_step_ms, 0.50),
+        "prefill_step_p95_ms": percentile(prefill_step_ms, 0.95),
+        "decode_step_p50_ms": percentile(decode_step_ms, 0.50),
+        "decode_step_p95_ms": percentile(decode_step_ms, 0.95),
+        "peak_memory_mib": max(result.peak_memory_mib for result in results),
+    }
+
+
+def run_serving_benchmark(
+    args: argparse.Namespace,
+    tokenizer: Tokenizer,
+) -> None:
+    """大 Batch、长短 Prompt 混合的吞吐与请求时延总基准。"""
+
+    batch_sizes = parse_positive_int_list(
+        args.batch_sizes,
+        name="--batch-sizes",
+    )
+    prompt_profile = parse_positive_int_list(
+        args.prompt_lengths,
+        name="--prompt-lengths",
+    )
+    if args.num_requests <= 0:
+        raise ValueError("--num-requests 必须大于 0")
+    if not 0 < args.short_new_tokens <= args.max_new_tokens:
+        raise ValueError("--short-new-tokens 必须位于输出上限范围内")
+
+    warmup = 1 if args.warmup is None else args.warmup
+    iterations = 2 if args.iterations is None else args.iterations
+    label = args.label or "baseline-before-chunked-prefill"
+    config = ModelConfig.from_pretrained(args.model)
+    prompt_lengths = [
+        prompt_profile[index % len(prompt_profile)]
+        for index in range(args.num_requests)
+    ]
+    prompts = [
+        make_exact_length_prompt(tokenizer, length, variant=index)
+        for index, length in enumerate(prompt_lengths)
+    ]
+    output_limits = [
+        args.short_new_tokens if index % 2 == 0 else args.max_new_tokens
+        for index in range(args.num_requests)
+    ]
+    loaded = load_model(config, device="cuda")
+    rows: list[dict[str, object]] = []
+
+    def required_blocks(max_num_seqs: int) -> int:
+        per_request = sorted(
+            (
+                (length + limit + args.block_size - 1) // args.block_size
+                for length, limit in zip(prompt_lengths, output_limits)
+            ),
+            reverse=True,
+        )
+        return sum(per_request[:max_num_seqs]) + max_num_seqs
+
+    def run_one(backend: str, batch_size: int) -> ContinuousBatchResult:
+        num_blocks = max(args.num_kv_blocks, required_blocks(batch_size))
+        engine = PagedContinuousBatchEngine(
+            loaded.model,
+            max_num_seqs=batch_size,
+            pad_token_id=tokenizer.pad_token_id,
+            num_blocks=num_blocks,
+            block_size=args.block_size,
+            attention_backend=backend,
+        )
+        for prompt, limit in zip(prompts, output_limits):
+            engine.add_request(
+                prompt,
+                max_new_tokens=limit,
+                # 固定生成长度，避免 EOS 让不同后端工作量发生变化。
+                eos_token_ids=set(),
+            )
+        return engine.run()
+
+    variants = ("gather", "triton")
+    for batch_size in batch_sizes:
+        # Triton JIT/autotune 的缓存 key 包含 batch 和序列形状。每个 BS 都必须
+        # 单独预热，否则第一次测量较大 batch 时，编译和选参时间会污染 TTFT。
+        for _ in range(warmup):
+            for backend in variants:
+                run_one(backend, batch_size)
+
+        config_results: dict[str, list[ContinuousBatchResult]] = {
+            backend: [] for backend in variants
+        }
+        for iteration in range(iterations):
+            order = variants if iteration % 2 == 0 else tuple(reversed(variants))
+            for backend in order:
+                config_results[backend].append(run_one(backend, batch_size))
+
+        for backend in variants:
+            metrics = summarize_serving_results(
+                config_results[backend],
+                input_tokens_per_run=sum(prompt_lengths),
+                requests_per_run=args.num_requests,
+            )
+            rows.append(
+                {
+                    "cache_backend": backend,
+                    "max_num_seqs": batch_size,
+                    "num_kv_blocks": max(
+                        args.num_kv_blocks,
+                        required_blocks(batch_size),
+                    ),
+                    **metrics,
+                }
+            )
+
+    print("Long-context serving baseline before chunked prefill")
+    print(f"  请求数          : {args.num_requests}")
+    print(f"  Prompt 长度     : {prompt_lengths}")
+    print(f"  输出上限        : {output_limits}")
+    print(f"  最大并发        : {batch_sizes}")
+    print()
+    print(
+        "backend  BS  total tok/s  out tok/s  "
+        "TTFT P50/P95 ms  TPOT P50/P95 ms  E2E P95 ms  VRAM MiB"
+    )
+    for row in rows:
+        print(
+            f"{row['cache_backend']:<8} "
+            f"{row['max_num_seqs']:>2} "
+            f"{row['total_tokens_per_second']:>12.1f} "
+            f"{row['output_tokens_per_second']:>10.1f} "
+            f"{row['ttft_p50_ms']:>8.1f}/{row['ttft_p95_ms']:<8.1f} "
+            f"{row['tpot_p50_ms']:>8.1f}/{row['tpot_p95_ms']:<8.1f} "
+            f"{row['e2e_p95_ms']:>10.1f} "
+            f"{row['peak_memory_mib']:>9.1f}"
+        )
+
+    if args.save:
+        append_record(
+            args.save,
+            label=label,
+            metrics={
+                "backend": "serving",
+                "iterations": iterations,
+                "rows": rows,
+            },
+            metadata={
+                "model": args.model,
+                "prompt_lengths": prompt_lengths,
+                "output_limits": output_limits,
+                "batch_sizes": batch_sizes,
+                "warmup": warmup,
+                "block_size": args.block_size,
+            },
+        )
+        print(f"\n结果已追加到：{args.save}")
 
 
 def run_paged_benchmark(

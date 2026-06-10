@@ -1,7 +1,6 @@
 import unittest
 
-from toyvllm.scheduler import Scheduler
-from toyvllm.sequence import FinishReason, SequenceStatus
+from toyvllm.engine import FinishReason, Scheduler, SequenceStatus
 
 
 class SchedulerTest(unittest.TestCase):

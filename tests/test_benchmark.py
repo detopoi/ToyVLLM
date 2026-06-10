@@ -3,10 +3,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from toyvllm.benchmark import BenchmarkResult, append_result
+from toyvllm.benchmark import BenchmarkResult, append_result, percentile
 
 
 class BenchmarkTest(unittest.TestCase):
+    def test_percentile_uses_linear_interpolation(self) -> None:
+        values = [10.0, 20.0, 30.0, 40.0]
+        self.assertEqual(percentile(values, 0.0), 10.0)
+        self.assertEqual(percentile(values, 0.5), 25.0)
+        self.assertEqual(percentile(values, 0.95), 38.5)
+
     def test_metrics(self) -> None:
         result = BenchmarkResult(
             name="test",
