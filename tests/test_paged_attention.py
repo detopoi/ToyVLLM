@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from toyvllm.block_manager import BlockManager
+from toyvllm.engine import BlockManager
 from toyvllm.kv_cache import PagedKVCache
 from toyvllm.kernels.paged_attention import (
     clear_triton_autotune_cache,

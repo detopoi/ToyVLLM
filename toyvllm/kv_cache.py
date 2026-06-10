@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
-from toyvllm.block_manager import BlockTable, PhysicalTokenSlot
+from toyvllm.engine.block_manager import BlockTable, PhysicalTokenSlot
 from toyvllm.layers.attention import KVCache, PagedAttentionMetadata
 
 

@@ -41,6 +41,16 @@ class ContinuousBatchEngineTest(unittest.TestCase):
         actual = [sequence.output_token_ids for sequence in result.sequences]
         self.assertEqual(actual, expected)
         self.assertEqual(result.completion_order, (0, 2, 1))
+        self.assertEqual(len(result.request_first_token_seconds), len(prompts))
+        self.assertTrue(
+            all(
+                0.0 < first <= finish
+                for first, finish in zip(
+                    result.request_first_token_seconds,
+                    result.request_finish_seconds,
+                )
+            )
+        )
 
         # 第 0 轮先 prefill 请求 0/1；第 1 轮请求 0 完成，空槽立即给请求 2。
         self.assertEqual(result.iterations[0].prefill_request_ids, (0, 1))

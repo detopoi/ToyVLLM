@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from toyvllm.block_manager import BlockManager
+from toyvllm.engine import BlockManager
 from toyvllm.kv_cache import PagedKVCache
 
 

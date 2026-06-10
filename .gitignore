@@ -4,4 +4,5 @@ __pycache__/
 .venv/
 benchmarks/*.jsonl
 .idea/
+Qwen3-0.6B/
 Qwen3-1.7B/

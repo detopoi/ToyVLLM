@@ -11,13 +11,13 @@ from dataclasses import dataclass
 
 import torch
 
-from toyvllm.block_manager import BlockManager, OutOfBlocksError
+from toyvllm.engine.block_manager import BlockManager, OutOfBlocksError
 from toyvllm.kv_cache import PagedKVCache
 from toyvllm.layers.attention import KVCache
 from toyvllm.models.qwen3 import Qwen3ForCausalLM
 from toyvllm.sampling import SamplingParams, sample_next_token
-from toyvllm.scheduler import Scheduler
-from toyvllm.sequence import Sequence
+from toyvllm.engine.scheduler import Scheduler
+from toyvllm.engine.sequence import Sequence
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,7 @@ class ContinuousBatchResult:
     iterations: tuple[EngineIteration, ...]
     total_seconds: float
     peak_memory_mib: float
+    request_first_token_seconds: tuple[float, ...]
     request_finish_seconds: tuple[float, ...]
 
     @property
@@ -98,6 +99,7 @@ class ContinuousBatchEngine:
         # 以下字段记录整个 Engine 执行生命周期。step() 和 run() 共用它们，
         # 所以既支持一次跑完，也支持服务端在轮次之间插入在线请求。
         self._run_started = 0.0
+        self._first_token_seconds: dict[int, float] = {}
         self._finish_seconds: dict[int, float] = {}
         self._iterations: list[EngineIteration] = []
         self._step_index = 0
@@ -155,6 +157,10 @@ class ContinuousBatchEngine:
             iterations=tuple(self._iterations),
             total_seconds=total_seconds,
             peak_memory_mib=peak_memory_mib,
+            request_first_token_seconds=tuple(
+                self._first_token_seconds[sequence.request_id]
+                for sequence in sequences
+            ),
             request_finish_seconds=tuple(
                 self._finish_seconds[sequence.request_id]
                 for sequence in sequences
@@ -217,6 +223,7 @@ class ContinuousBatchEngine:
             torch.cuda.reset_peak_memory_stats(self.device)
             torch.cuda.synchronize(self.device)
         self._run_started = time.perf_counter()
+        self._first_token_seconds.clear()
         self._finish_seconds.clear()
         self._execution_started = True
 
@@ -268,10 +275,14 @@ class ContinuousBatchEngine:
         # Engine 在这里拆成 request_id -> per-layer cache。
         caches = self._unpack_cache(packed_cache, attention_mask)
         next_tokens = self._sample_rows(logits[:, -1], sequences)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        first_token_seconds = time.perf_counter() - self._run_started
         for index, sequence in enumerate(sequences):
             # 必须先保存本轮缓存，再提交 token。未完成请求下轮 Decode 要使用它；
             # 若 token 让请求完成，下面会马上 release，不会造成长期泄漏。
             self._caches[sequence.request_id] = caches[index]
+            self._first_token_seconds[sequence.request_id] = first_token_seconds
             finish_reason = self.scheduler.append_token(
                 sequence,
                 int(next_tokens[index].item()),
@@ -648,7 +659,11 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
         )
 
         next_tokens = self._sample_rows(logits[:, -1], sequences)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        first_token_seconds = time.perf_counter() - self._run_started
         for index, sequence in enumerate(sequences):
+            self._first_token_seconds[sequence.request_id] = first_token_seconds
             finish_reason = self.scheduler.append_token(
                 sequence,
                 int(next_tokens[index].item()),

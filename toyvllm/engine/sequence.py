@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""生成请求的数据模型。
+"""Engine 内部的生成请求数据模型。
 
 这个模块不包含调度策略，也不接触 GPU Tensor。它只描述“一条请求现在走到哪一步”，
 是 Scheduler 和 Engine 之间共享的状态对象。

@@ -1,6 +1,6 @@
 import unittest
 
-from toyvllm.block_manager import BlockManager, OutOfBlocksError
+from toyvllm.engine import BlockManager, OutOfBlocksError
 
 
 class BlockManagerTest(unittest.TestCase):

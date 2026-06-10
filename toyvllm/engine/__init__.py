@@ -1,0 +1,75 @@
+from __future__ import annotations
+
+"""推理引擎子系统的公共入口。
+
+内部模块按职责拆分，但调用方只需要从 ``toyvllm.engine`` 导入公共类型。
+这里使用延迟导入，避免 ``llm_engine -> kv_cache -> block_manager`` 形成循环依赖。
+"""
+
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from toyvllm.engine.block_manager import (
+        BlockManager,
+        BlockManagerStats,
+        BlockTable,
+        OutOfBlocksError,
+        PhysicalTokenSlot,
+    )
+    from toyvllm.engine.llm_engine import (
+        ContinuousBatchEngine,
+        ContinuousBatchResult,
+        EngineIteration,
+        PagedContinuousBatchEngine,
+    )
+    from toyvllm.engine.scheduler import Scheduler
+    from toyvllm.engine.sequence import FinishReason, Sequence, SequenceStatus
+
+__all__ = [
+    "BlockManager",
+    "BlockManagerStats",
+    "BlockTable",
+    "ContinuousBatchEngine",
+    "ContinuousBatchResult",
+    "EngineIteration",
+    "FinishReason",
+    "OutOfBlocksError",
+    "PagedContinuousBatchEngine",
+    "PhysicalTokenSlot",
+    "Scheduler",
+    "Sequence",
+    "SequenceStatus",
+]
+
+
+def __getattr__(name: str) -> Any:
+    """按需加载公共对象，让轻量控制面测试不必导入模型和 CUDA 路径。"""
+
+    if name in {
+        "ContinuousBatchEngine",
+        "ContinuousBatchResult",
+        "EngineIteration",
+        "PagedContinuousBatchEngine",
+    }:
+        from toyvllm.engine import llm_engine
+
+        return getattr(llm_engine, name)
+    if name in {
+        "BlockManager",
+        "BlockManagerStats",
+        "BlockTable",
+        "OutOfBlocksError",
+        "PhysicalTokenSlot",
+    }:
+        from toyvllm.engine import block_manager
+
+        return getattr(block_manager, name)
+    if name == "Scheduler":
+        from toyvllm.engine.scheduler import Scheduler
+
+        return Scheduler
+    if name in {"FinishReason", "Sequence", "SequenceStatus"}:
+        from toyvllm.engine import sequence
+
+        return getattr(sequence, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

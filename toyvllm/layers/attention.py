@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from toyvllm.block_manager import BlockTable
+from toyvllm.engine.block_manager import BlockTable
 from toyvllm.layers.rms_norm import RMSNorm
 from toyvllm.layers.rotary_embedding import RotaryEmbedding
 

@@ -59,6 +59,21 @@ class BenchmarkResult:
         }
 
 
+def percentile(values: list[float], probability: float) -> float:
+    """使用线性插值计算分位数，避免 benchmark 依赖 NumPy。"""
+
+    if not values:
+        raise ValueError("values 不能为空")
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError("probability 必须位于 [0, 1]")
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * probability
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
 def append_result(
     output_path: str | Path,
     result: BenchmarkResult,
