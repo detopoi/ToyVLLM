@@ -131,6 +131,27 @@ def build_parser() -> argparse.ArgumentParser:
     continuous_parser.add_argument("--num-kv-blocks", type=int, default=64)
     continuous_parser.add_argument("--block-size", type=int, default=16)
     continuous_parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=None,
+        help=(
+            "每轮 Decode + Prefill 的 token budget；设置后为 paged 后端启用 "
+            "Chunked Prefill"
+        ),
+    )
+    continuous_parser.add_argument(
+        "--max-prefill-chunk-size",
+        type=int,
+        default=256,
+        help="Chunked Prefill 中单条请求每轮最多处理的 Prompt token 数",
+    )
+    continuous_parser.add_argument(
+        "--max-mixed-prefill-tokens",
+        type=int,
+        default=None,
+        help="已有 Decode 时，同轮 Prefill token 总上限；默认仍使用剩余总预算",
+    )
+    continuous_parser.add_argument(
         "--paged-attention",
         choices=(
             "auto",
@@ -261,6 +282,9 @@ def main() -> None:
                 num_blocks=args.num_kv_blocks,
                 block_size=args.block_size,
                 attention_backend=args.paged_attention,
+                max_num_batched_tokens=args.max_num_batched_tokens,
+                max_prefill_chunk_size=args.max_prefill_chunk_size,
+                max_mixed_prefill_tokens=args.max_mixed_prefill_tokens,
             )
         else:
             engine = ContinuousBatchEngine(
@@ -291,6 +315,14 @@ def main() -> None:
                 f"{args.block_size} tokens"
             )
             print(f"Paged Attention：{engine.attention_backend}")
+            if engine.chunked_prefill_enabled:
+                print(
+                    "Chunked Prefill："
+                    f"budget={engine.max_num_batched_tokens}, "
+                    f"max_chunk={engine.max_prefill_chunk_size}, "
+                    "mixed_prefill="
+                    f"{engine.max_mixed_prefill_tokens or 'unbounded'}"
+                )
         print(f"解码策略：{format_sampling_params(sampling_params)}")
         print(f"调度轮数：{len(result.iterations)}")
         print(f"总输出吞吐：{result.output_tokens_per_second:.2f} tokens/s")
@@ -310,7 +342,8 @@ def main() -> None:
                 print(
                     f"step={iteration.step:02d} "
                     f"decode={list(iteration.decode_request_ids)} "
-                    f"prefill={list(iteration.prefill_request_ids)}"
+                    "prefill="
+                    f"{list(zip(iteration.prefill_request_ids, iteration.prefill_token_counts))}"
                 )
 
         for sequence in result.sequences:

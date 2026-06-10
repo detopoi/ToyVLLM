@@ -22,7 +22,7 @@ if TYPE_CHECKING:
         EngineIteration,
         PagedContinuousBatchEngine,
     )
-    from toyvllm.engine.scheduler import Scheduler
+    from toyvllm.engine.scheduler import PagedScheduler, ScheduledPrefill, Scheduler
     from toyvllm.engine.sequence import FinishReason, Sequence, SequenceStatus
 
 __all__ = [
@@ -34,8 +34,10 @@ __all__ = [
     "EngineIteration",
     "FinishReason",
     "OutOfBlocksError",
+    "PagedScheduler",
     "PagedContinuousBatchEngine",
     "PhysicalTokenSlot",
+    "ScheduledPrefill",
     "Scheduler",
     "Sequence",
     "SequenceStatus",
@@ -64,10 +66,10 @@ def __getattr__(name: str) -> Any:
         from toyvllm.engine import block_manager
 
         return getattr(block_manager, name)
-    if name == "Scheduler":
-        from toyvllm.engine.scheduler import Scheduler
+    if name in {"PagedScheduler", "ScheduledPrefill", "Scheduler"}:
+        from toyvllm.engine import scheduler
 
-        return Scheduler
+        return getattr(scheduler, name)
     if name in {"FinishReason", "Sequence", "SequenceStatus"}:
         from toyvllm.engine import sequence
 

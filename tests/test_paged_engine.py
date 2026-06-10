@@ -9,6 +9,111 @@ from toyvllm.models.qwen3 import Qwen3ForCausalLM
 
 
 class PagedContinuousBatchEngineTest(unittest.TestCase):
+    def test_chunked_prefill_matches_individual_generation(self) -> None:
+        torch.manual_seed(0)
+        model = Qwen3ForCausalLM(tiny_config()).eval()
+        prompts = [[1, 2], [3, 4, 5, 6, 7, 8, 9]]
+        limits = [4, 3]
+        expected = [
+            generate_greedy_cached(
+                model,
+                prompt,
+                max_new_tokens=limit,
+                eos_token_ids=set(),
+            ).output_token_ids
+            for prompt, limit in zip(prompts, limits)
+        ]
+
+        engine = PagedContinuousBatchEngine(
+            model,
+            max_num_seqs=2,
+            pad_token_id=0,
+            num_blocks=12,
+            block_size=2,
+            attention_backend="paged",
+            max_num_batched_tokens=4,
+            max_prefill_chunk_size=2,
+            max_mixed_prefill_tokens=2,
+        )
+        for prompt, limit in zip(prompts, limits):
+            engine.add_request(
+                prompt,
+                max_new_tokens=limit,
+                eos_token_ids=set(),
+            )
+        result = engine.run()
+
+        self.assertEqual(
+            [sequence.output_token_ids for sequence in result.sequences],
+            expected,
+        )
+        self.assertTrue(
+            any(
+                iteration.decode_request_ids
+                and iteration.prefill_request_ids
+                for iteration in result.iterations
+            )
+        )
+        for iteration in result.iterations:
+            scheduled_tokens = (
+                len(iteration.decode_request_ids)
+                + sum(iteration.prefill_token_counts)
+            )
+            self.assertLessEqual(scheduled_tokens, 4)
+            if iteration.decode_request_ids:
+                self.assertLessEqual(sum(iteration.prefill_token_counts), 2)
+        self.assertEqual(
+            engine.block_manager.stats.num_free_blocks,
+            engine.block_manager.stats.num_total_blocks,
+        )
+
+    def test_chunked_prefill_batches_different_history_lengths(self) -> None:
+        torch.manual_seed(1)
+        model = Qwen3ForCausalLM(tiny_config()).eval()
+        prompts = [
+            [1, 2, 3, 4],
+            [5, 6, 7, 8, 9, 10, 11],
+            [12, 13, 14, 15, 16, 17, 18, 19, 20],
+        ]
+        expected = [
+            generate_greedy_cached(
+                model,
+                prompt,
+                max_new_tokens=2,
+                eos_token_ids=set(),
+            ).output_token_ids
+            for prompt in prompts
+        ]
+        engine = PagedContinuousBatchEngine(
+            model,
+            max_num_seqs=3,
+            pad_token_id=0,
+            num_blocks=16,
+            block_size=2,
+            attention_backend="paged",
+            max_num_batched_tokens=7,
+            max_prefill_chunk_size=4,
+        )
+        for prompt in prompts:
+            engine.add_request(
+                prompt,
+                max_new_tokens=2,
+                eos_token_ids=set(),
+            )
+        result = engine.run()
+
+        self.assertEqual(
+            [sequence.output_token_ids for sequence in result.sequences],
+            expected,
+        )
+        self.assertTrue(
+            any(
+                len(set(iteration.prefill_token_counts)) > 1
+                for iteration in result.iterations
+                if len(iteration.prefill_token_counts) > 1
+            )
+        )
+
     def test_paged_engine_matches_individual_generation(self) -> None:
         torch.manual_seed(0)
         model = Qwen3ForCausalLM(tiny_config()).eval()

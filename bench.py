@@ -72,6 +72,24 @@ def main() -> None:
     parser.add_argument("--num-kv-blocks", type=int, default=64)
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=None,
+        help="paged/serving 基准启用 Chunked Prefill 时的每轮 token budget",
+    )
+    parser.add_argument(
+        "--max-prefill-chunk-size",
+        type=int,
+        default=256,
+        help="单条请求每轮最多处理的 Prompt token 数",
+    )
+    parser.add_argument(
+        "--max-mixed-prefill-tokens",
+        type=int,
+        default=None,
+        help="存在 Decode 请求时，每轮 Prefill token 总上限",
+    )
+    parser.add_argument(
         "--batch-sizes",
         default="1,2,4,8",
         help="serving 基准使用的最大并发列表",
@@ -315,6 +333,9 @@ def run_serving_benchmark(
             num_blocks=num_blocks,
             block_size=args.block_size,
             attention_backend=backend,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            max_prefill_chunk_size=args.max_prefill_chunk_size,
+            max_mixed_prefill_tokens=args.max_mixed_prefill_tokens,
         )
         for prompt, limit in zip(prompts, output_limits):
             engine.add_request(
@@ -359,7 +380,12 @@ def run_serving_benchmark(
                 }
             )
 
-    print("Long-context serving baseline before chunked prefill")
+    mode = (
+        "chunked prefill"
+        if args.max_num_batched_tokens is not None
+        else "full prefill baseline"
+    )
+    print(f"Long-context serving benchmark: {mode}")
     print(f"  请求数          : {args.num_requests}")
     print(f"  Prompt 长度     : {prompt_lengths}")
     print(f"  输出上限        : {output_limits}")
@@ -397,6 +423,9 @@ def run_serving_benchmark(
                 "batch_sizes": batch_sizes,
                 "warmup": warmup,
                 "block_size": args.block_size,
+                "max_num_batched_tokens": args.max_num_batched_tokens,
+                "max_prefill_chunk_size": args.max_prefill_chunk_size,
+                "max_mixed_prefill_tokens": args.max_mixed_prefill_tokens,
             },
         )
         print(f"\n结果已追加到：{args.save}")

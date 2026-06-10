@@ -16,7 +16,7 @@ from toyvllm.kv_cache import PagedKVCache
 from toyvllm.layers.attention import KVCache
 from toyvllm.models.qwen3 import Qwen3ForCausalLM
 from toyvllm.sampling import SamplingParams, sample_next_token
-from toyvllm.engine.scheduler import Scheduler
+from toyvllm.engine.scheduler import PagedScheduler, ScheduledPrefill, Scheduler
 from toyvllm.engine.sequence import Sequence
 
 
@@ -27,6 +27,7 @@ class EngineIteration:
     step: int
     decode_request_ids: tuple[int, ...]
     prefill_request_ids: tuple[int, ...]
+    prefill_token_counts: tuple[int, ...]
     decode_seconds: float
     prefill_seconds: float
 
@@ -187,7 +188,7 @@ class ContinuousBatchEngine:
 
         # running 是进入本轮前的快照。执行期间 Scheduler 可能删除其中的完成请求，
         # 但 tuple 本身稳定，不会出现遍历字典时修改集合的问题。
-        decode_sequences = self.scheduler.running
+        decode_sequences = self.scheduler.decoding
         decode_seconds = self._execute_decode(decode_sequences, step=step)
 
         # 这里只返回新接纳请求。旧 running 已经在上面 Decode 过，不能再 Prefill。
@@ -201,6 +202,9 @@ class ContinuousBatchEngine:
             ),
             prefill_request_ids=tuple(
                 sequence.request_id for sequence in prefill_sequences
+            ),
+            prefill_token_counts=tuple(
+                len(sequence.prompt_token_ids) for sequence in prefill_sequences
             ),
             decode_seconds=decode_seconds,
             prefill_seconds=prefill_seconds,
@@ -282,6 +286,7 @@ class ContinuousBatchEngine:
             # 必须先保存本轮缓存，再提交 token。未完成请求下轮 Decode 要使用它；
             # 若 token 让请求完成，下面会马上 release，不会造成长期泄漏。
             self._caches[sequence.request_id] = caches[index]
+            sequence.advance_prefill(len(sequence.prompt_token_ids))
             self._first_token_seconds[sequence.request_id] = first_token_seconds
             finish_reason = self.scheduler.append_token(
                 sequence,
@@ -526,6 +531,9 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
         attention_backend: str = "paged",
         vectorized_decode_write: bool = True,
         resident_block_tables: bool = True,
+        max_num_batched_tokens: int | None = None,
+        max_prefill_chunk_size: int = 256,
+        max_mixed_prefill_tokens: int | None = None,
     ) -> None:
         super().__init__(
             model,
@@ -538,6 +546,19 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
             num_blocks=num_blocks,
             block_size=block_size,
         )
+        self.max_num_batched_tokens = max_num_batched_tokens
+        self.max_prefill_chunk_size = max_prefill_chunk_size
+        self.max_mixed_prefill_tokens = max_mixed_prefill_tokens
+        if max_num_batched_tokens is not None:
+            # 父类先创建普通 Scheduler；Paged Scheduler 还需要刚建立的 BlockManager，
+            # 所以在这里替换。此时尚未 add_request，不会丢失任何请求状态。
+            self.scheduler = PagedScheduler(
+                max_num_seqs,
+                block_manager=self.block_manager,
+                max_num_batched_tokens=max_num_batched_tokens,
+                max_prefill_chunk_size=max_prefill_chunk_size,
+                max_mixed_prefill_tokens=max_mixed_prefill_tokens,
+            )
         self.paged_cache = PagedKVCache(
             num_layers=config.num_hidden_layers,
             num_blocks=num_blocks,
@@ -575,6 +596,56 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
         # 父类的 _caches 属于连续 Tensor 后端。分页后端不使用它，
         # 保留空字典仅是为了维持父类初始化契约。
         self._caches.clear()
+
+    @property
+    def chunked_prefill_enabled(self) -> bool:
+        return self.max_num_batched_tokens is not None
+
+    @torch.inference_mode()
+    def step(self) -> EngineIteration:
+        """分页引擎在启用 token budget 时执行 Decode 优先的 PD 混合调度。"""
+
+        if not self.chunked_prefill_enabled:
+            return super().step()
+        if self.scheduler.is_done:
+            raise RuntimeError("当前没有可调度请求")
+        if not isinstance(self.scheduler, PagedScheduler):
+            raise RuntimeError("Chunked Prefill 需要 PagedScheduler")
+
+        self._ensure_execution_started()
+        step = self._step_index
+
+        # Decode 请求已经对延迟敏感，因此先保证每条请求前进一步。完成请求会立即
+        # 释放运行槽和 KV Block，下面的 Prefill admission 可在同一轮复用资源。
+        decode_sequences = self.scheduler.decoding
+        decode_seconds = self._execute_decode(decode_sequences, step=step)
+
+        prefill_chunks = self.scheduler.schedule_prefill(
+            step=step,
+            num_decode_tokens=len(decode_sequences),
+        )
+        prefill_seconds = self._execute_chunked_prefill(
+            prefill_chunks,
+            step=step,
+        )
+
+        iteration = EngineIteration(
+            step=step,
+            decode_request_ids=tuple(
+                sequence.request_id for sequence in decode_sequences
+            ),
+            prefill_request_ids=tuple(
+                chunk.sequence.request_id for chunk in prefill_chunks
+            ),
+            prefill_token_counts=tuple(
+                chunk.num_tokens for chunk in prefill_chunks
+            ),
+            decode_seconds=decode_seconds,
+            prefill_seconds=prefill_seconds,
+        )
+        self._iterations.append(iteration)
+        self._step_index += 1
+        return iteration
 
     def _admit_waiting(self, *, step: int) -> tuple[Sequence, ...]:
         """同时受运行槽位和空闲 KV Block 约束的 FIFO admission。"""
@@ -663,6 +734,132 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
             torch.cuda.synchronize(self.device)
         first_token_seconds = time.perf_counter() - self._run_started
         for index, sequence in enumerate(sequences):
+            sequence.advance_prefill(len(sequence.prompt_token_ids))
+            self._first_token_seconds[sequence.request_id] = first_token_seconds
+            finish_reason = self.scheduler.append_token(
+                sequence,
+                int(next_tokens[index].item()),
+                step=step,
+            )
+            if finish_reason is not None:
+                self._finish_seconds[sequence.request_id] = (
+                    time.perf_counter() - self._run_started
+                )
+                self._release(sequence.request_id)
+        return elapsed
+
+    def _execute_chunked_prefill(
+        self,
+        chunks: tuple[ScheduledPrefill, ...],
+        *,
+        step: int,
+    ) -> float:
+        """把多条 Prompt chunk 组成一个带历史缓存的规则 Batch。
+
+        每条请求的历史长度和本轮 chunk 长度都可能不同：
+
+        - 历史 KV 在左侧补齐到 ``max_history``；
+        - 当前 chunk 也在左侧补齐到 ``max_chunk``；
+        - attention mask 连接两部分，保证 Padding 不参与注意力；
+        - 模型返回后只取每行最后 ``chunk_size`` 个 K/V 写回物理槽位。
+
+        这样一次模型前向即可处理多个 chunk，同时长期状态仍只保存在 Paged KV 池。
+        """
+
+        if not chunks:
+            return 0.0
+
+        sequences = tuple(chunk.sequence for chunk in chunks)
+        chunk_token_ids = tuple(
+            chunk.sequence.next_prompt_chunk(chunk.num_tokens)
+            for chunk in chunks
+        )
+        max_chunk = max(len(token_ids) for token_ids in chunk_token_ids)
+        input_rows = []
+        current_mask_rows = []
+        for token_ids in chunk_token_ids:
+            padding = max_chunk - len(token_ids)
+            input_rows.append([self.pad_token_id] * padding + token_ids)
+            current_mask_rows.append([0] * padding + [1] * len(token_ids))
+        input_ids = torch.tensor(
+            input_rows,
+            dtype=torch.long,
+            device=self.device,
+        )
+        current_mask = torch.tensor(
+            current_mask_rows,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        history_tables = tuple(chunk.history_table for chunk in chunks)
+        max_history = max(table.num_tokens for table in history_tables)
+        past_key_values = None
+        if max_history:
+            past_key_values, history_mask = self.paged_cache.read_batch(
+                history_tables
+            )
+        else:
+            history_mask = torch.empty(
+                (len(chunks), 0),
+                dtype=torch.long,
+                device=self.device,
+            )
+        attention_mask = torch.cat((history_mask, current_mask), dim=1)
+
+        started = self._start_timing()
+        logits, packed_present = self.model(
+            input_ids,
+            last_token_only=True,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        self._stop_timing()
+        elapsed = time.perf_counter() - started
+
+        for batch_index, chunk in enumerate(chunks):
+            layer_values: list[KVCache] = []
+            for key, value in packed_present:
+                layer_values.append(
+                    (
+                        key[
+                            batch_index : batch_index + 1,
+                            :,
+                            -chunk.num_tokens :,
+                            :,
+                        ],
+                        value[
+                            batch_index : batch_index + 1,
+                            :,
+                            -chunk.num_tokens :,
+                            :,
+                        ],
+                    )
+                )
+            self.paged_cache.write(chunk.slots, layer_values)
+            chunk.sequence.advance_prefill(chunk.num_tokens)
+
+        completed_indices = [
+            index
+            for index, sequence in enumerate(sequences)
+            if sequence.is_prefill_complete
+        ]
+        if not completed_indices:
+            return elapsed
+
+        completed_sequences = tuple(
+            sequences[index] for index in completed_indices
+        )
+        completed_logits = logits[completed_indices, -1]
+        next_tokens = self._sample_rows(
+            completed_logits,
+            completed_sequences,
+        )
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        first_token_seconds = time.perf_counter() - self._run_started
+        for index, sequence in enumerate(completed_sequences):
             self._first_token_seconds[sequence.request_id] = first_token_seconds
             finish_reason = self.scheduler.append_token(
                 sequence,

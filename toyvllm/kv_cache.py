@@ -246,7 +246,19 @@ class PagedKVCache:
         if table.block_size != self.shape.block_size:
             raise ValueError("BlockTable 与物理池的 block_size 不一致")
         if table.num_tokens == 0:
-            raise ValueError("不能读取空请求的 KV Cache")
+            # Chunked Prefill 的首个 chunk 尚无历史。返回形状正确的零长度 Cache，
+            # 使 read_batch 可以把“无历史”和“有历史”请求放进同一个 Batch。
+            return [
+                (
+                    self.key_cache.new_empty(
+                        (1, self.shape.num_kv_heads, 0, self.shape.head_dim)
+                    ),
+                    self.value_cache.new_empty(
+                        (1, self.shape.num_kv_heads, 0, self.shape.head_dim)
+                    ),
+                )
+                for _ in range(self.shape.num_layers)
+            ]
 
         slots = table.slots()
         block_ids = torch.tensor(

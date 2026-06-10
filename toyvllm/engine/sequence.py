@@ -59,6 +59,9 @@ class Sequence:
     finish_reason: FinishReason | None = None
     admitted_step: int | None = None
     finished_step: int | None = None
+    # Chunked Prefill 的游标。它只表示已有多少 Prompt token 完成模型计算并写入
+    # KV Cache，不包含生成 token。完整 Prefill 模式会一次把它推进到 Prompt 末尾。
+    num_prompt_tokens_computed: int = 0
 
     def __post_init__(self) -> None:
         if not self.prompt_token_ids:
@@ -73,6 +76,34 @@ class Sequence:
         if not self.output_token_ids:
             raise RuntimeError("请求尚未生成第一个 token")
         return self.output_token_ids[-1]
+
+    @property
+    def num_prompt_tokens_remaining(self) -> int:
+        return len(self.prompt_token_ids) - self.num_prompt_tokens_computed
+
+    @property
+    def is_prefill_complete(self) -> bool:
+        return self.num_prompt_tokens_remaining == 0
+
+    def next_prompt_chunk(self, num_tokens: int) -> list[int]:
+        """返回下一段尚未计算的 Prompt token，但不提前移动游标。"""
+
+        if num_tokens <= 0:
+            raise ValueError("num_tokens 必须大于 0")
+        if num_tokens > self.num_prompt_tokens_remaining:
+            raise ValueError("Prefill chunk 超过剩余 Prompt 长度")
+        start = self.num_prompt_tokens_computed
+        return self.prompt_token_ids[start : start + num_tokens]
+
+    def advance_prefill(self, num_tokens: int) -> None:
+        """模型和 KV 写回成功后，原子提交本次 Prefill 进度。"""
+
+        if num_tokens <= 0:
+            raise ValueError("num_tokens 必须大于 0")
+        new_value = self.num_prompt_tokens_computed + num_tokens
+        if new_value > len(self.prompt_token_ids):
+            raise ValueError("Prefill 进度不能超过 Prompt 长度")
+        self.num_prompt_tokens_computed = new_value
 
     def append_token(self, token_id: int) -> FinishReason | None:
         """记录新 token，并只判断是否满足结束条件。

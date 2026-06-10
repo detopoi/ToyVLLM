@@ -151,6 +151,23 @@ Windows 环境安装本项目验证过的 Triton：
     "你好" "解释 KV Cache" "描述夏天"
 ```
 
+启用 Chunked Prefill 和 PD 混合调度：
+
+```powershell
+& $PYTHON -m toyvllm continuous --cache-backend paged `
+    --paged-attention triton --max-num-seqs 8 `
+    --max-num-batched-tokens 1024 --max-prefill-chunk-size 128 `
+    --num-kv-blocks 256 --show-schedule `
+    "你好" "详细解释 KV Cache" "介绍连续批处理"
+```
+
+- `--max-num-batched-tokens`：每轮 Decode 与 Prefill 共用的 token budget
+- `--max-prefill-chunk-size`：单条请求每轮最多处理多少 Prompt token
+- `--max-mixed-prefill-tokens`：可选的 Decode 延迟保护阀，限制混合轮 Prefill 总量
+
+只有设置 `--max-num-batched-tokens` 才会启用 Chunked Prefill。调度轨迹中的
+`prefill=[(request_id, token_count)]` 会显示每个请求本轮实际推进的 Prompt token。
+
 `auto` 在 CUDA 和 Triton 可用时选择 `triton`，否则回退到 `paged`。也可以显式使用：
 
 - `--paged-attention gather`：9B Gather + SDPA 对照路径
