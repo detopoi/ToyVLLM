@@ -289,6 +289,9 @@ def summarize_serving_results(
         "decode_step_p50_ms": percentile(decode_step_ms, 0.50),
         "decode_step_p95_ms": percentile(decode_step_ms, 0.95),
         "peak_memory_mib": max(result.peak_memory_mib for result in results),
+        "preemptions_per_run": statistics.fmean(
+            result.total_preemptions for result in results
+        ),
     }
 
 
@@ -333,12 +336,32 @@ def run_serving_benchmark(
     def required_blocks(max_num_seqs: int) -> int:
         per_request = sorted(
             (
-                (length + limit + args.block_size - 1) // args.block_size
+                (
+                    length
+                    + limit
+                    - 1
+                    + args.block_size
+                    - 1
+                )
+                // args.block_size
                 for length, limit in zip(prompt_lengths, output_limits)
             ),
             reverse=True,
         )
-        return sum(per_request[:max_num_seqs]) + max_num_seqs
+        return sum(per_request[:max_num_seqs])
+
+    def largest_request_blocks() -> int:
+        return max(
+            (
+                length
+                + limit
+                - 1
+                + args.block_size
+                - 1
+            )
+            // args.block_size
+            for length, limit in zip(prompt_lengths, output_limits)
+        )
 
     if args.num_kv_blocks is None:
         capacity_plan = plan_kv_cache_capacity(
@@ -353,7 +376,11 @@ def run_serving_benchmark(
     else:
         capacity_plan = None
         benchmark_num_blocks = args.num_kv_blocks
-    minimum_blocks = required_blocks(max(batch_sizes))
+    minimum_blocks = (
+        largest_request_blocks()
+        if args.max_num_batched_tokens is not None
+        else required_blocks(max(batch_sizes))
+    )
     if benchmark_num_blocks < minimum_blocks:
         raise ValueError(
             f"当前 workload 至少需要 {minimum_blocks} 个 KV Block，"
@@ -425,7 +452,8 @@ def run_serving_benchmark(
     print()
     print(
         "backend  BS  total tok/s  out tok/s  "
-        "TTFT P50/P95 ms  TPOT P50/P95 ms  E2E P95 ms  VRAM MiB"
+        "TTFT P50/P95 ms  TPOT P50/P95 ms  E2E P95 ms  "
+        "preempt/run  VRAM MiB"
     )
     for row in rows:
         print(
@@ -436,6 +464,7 @@ def run_serving_benchmark(
             f"{row['ttft_p50_ms']:>8.1f}/{row['ttft_p95_ms']:<8.1f} "
             f"{row['tpot_p50_ms']:>8.1f}/{row['tpot_p95_ms']:<8.1f} "
             f"{row['e2e_p95_ms']:>10.1f} "
+            f"{row['preemptions_per_run']:>11.1f} "
             f"{row['peak_memory_mib']:>9.1f}"
         )
 

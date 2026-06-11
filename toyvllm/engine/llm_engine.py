@@ -32,6 +32,7 @@ class EngineIteration:
     decode_request_ids: tuple[int, ...]
     prefill_request_ids: tuple[int, ...]
     prefill_token_counts: tuple[int, ...]
+    preempted_request_ids: tuple[int, ...]
     decode_seconds: float
     prefill_seconds: float
 
@@ -59,6 +60,10 @@ class ContinuousBatchResult:
     @property
     def requests_per_second(self) -> float:
         return len(self.sequences) / self.total_seconds
+
+    @property
+    def total_preemptions(self) -> int:
+        return sum(sequence.preemption_count for sequence in self.sequences)
 
 
 class ContinuousBatchEngine:
@@ -210,6 +215,7 @@ class ContinuousBatchEngine:
             prefill_token_counts=tuple(
                 len(sequence.prompt_token_ids) for sequence in prefill_sequences
             ),
+            preempted_request_ids=(),
             decode_seconds=decode_seconds,
             prefill_seconds=prefill_seconds,
         )
@@ -638,7 +644,7 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
 
         # Decode 请求已经对延迟敏感，因此先保证每条请求前进一步。完成请求会立即
         # 释放运行槽和 KV Block，下面的 Prefill admission 可在同一轮复用资源。
-        decode_sequences = self.scheduler.decoding
+        decode_sequences = self.scheduler.schedule_decode(step=step)
         decode_seconds = self._execute_decode(decode_sequences, step=step)
 
         prefill_chunks = self.scheduler.schedule_prefill(
@@ -660,6 +666,9 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
             ),
             prefill_token_counts=tuple(
                 chunk.num_tokens for chunk in prefill_chunks
+            ),
+            preempted_request_ids=(
+                self.scheduler.step_preempted_request_ids
             ),
             decode_seconds=decode_seconds,
             prefill_seconds=prefill_seconds,
@@ -756,7 +765,10 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
         first_token_seconds = time.perf_counter() - self._run_started
         for index, sequence in enumerate(sequences):
             sequence.advance_prefill(len(sequence.prompt_token_ids))
-            self._first_token_seconds[sequence.request_id] = first_token_seconds
+            self._first_token_seconds.setdefault(
+                sequence.request_id,
+                first_token_seconds,
+            )
             finish_reason = self.scheduler.append_token(
                 sequence,
                 int(next_tokens[index].item()),
@@ -881,7 +893,12 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
             torch.cuda.synchronize(self.device)
         first_token_seconds = time.perf_counter() - self._run_started
         for index, sequence in enumerate(completed_sequences):
-            self._first_token_seconds[sequence.request_id] = first_token_seconds
+            # RECOMPUTE 抢占可能让已经产生首 token 的请求再次走 Prefill。
+            # TTFT 必须保留第一次值，不能被重算完成时间覆盖。
+            self._first_token_seconds.setdefault(
+                sequence.request_id,
+                first_token_seconds,
+            )
             finish_reason = self.scheduler.append_token(
                 sequence,
                 int(next_tokens[index].item()),

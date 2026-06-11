@@ -2669,10 +2669,179 @@ Blocks=518
 当前算法是简单的后加载静态规划，还没有像完整 vLLM 那样运行一次最大形状 profile 来
 测量真实峰值激活。因此余量仍是显式参数，不能承诺任意输入形状绝不 OOM。
 
+### 2026-06-12：第 10H 步，Block 不足时的 RECOMPUTE 抢占
+
+Chunked Prefill 第一版在 admission 时为完整 Prompt 预留 Block。这样不会死锁，但会
+出现一个明显问题：
+
+```text
+请求 A 实际只计算了 16 token，却预留完整 768-token 容量
+请求 B 因为空闲 Block 不足停在 WAITING
+```
+
+本阶段改为按实际增长分配物理块，并在资源竞争时把低优先级请求移出 RUNNING。
+
+#### 1. 两种“放不下”必须区分
+
+资源竞争：
+
+```text
+A 单独需要 3 Blocks
+B 单独需要 3 Blocks
+物理池共有 4 Blocks
+```
+
+两条请求单独都能完成，只是不能同时保存完整 KV。这种情况可以抢占。
+
+物理上不可能：
+
+```text
+单个请求最大上下文需要 5 Blocks
+整个物理池只有 4 Blocks
+```
+
+移出 RUNNING 不会创造更多容量。Scheduler 在 admission 时直接抛出
+`OutOfBlocksError`，错误信息明确说明“即使独占 GPU 也无法完成”。
+
+最大 Block 需求按下面计算：
+
+```text
+prompt_tokens + max_new_tokens - 1
+```
+
+减一是因为最新生成的 output token 尚未写入 KV；它会作为下一轮 Decode 输入。
+
+#### 2. Chunked 模式改为增量分配
+
+新请求进入 RUNNING 时只注册空 BlockTable：
+
+```text
+physical_block_ids = ()
+num_tokens = 0
+```
+
+每个 Prefill chunk 调用 `reserve()`，只为本轮新增 token 分配必要 Block。
+`max_reservable_tokens()` 可以回答“把当前全部空闲块给这条请求，它最多还能前进多少
+token”，Scheduler 会据此缩小 chunk，而不是直接失败。
+
+#### 3. Decode 为什么也可能需要抢占
+
+Decode 每轮只增加一个 token，但跨过 Block 边界时仍需要新物理块。若多条请求同时处于
+边界，`reserve_many()` 可能需要的块数大于当前空闲数。
+
+Scheduler 先运行 `schedule_decode()`：
+
+1. 汇总本轮所有 Decode 请求新增 1 token 所需的新 Block。
+2. 若容量足够，整个 Decode Batch 正常运行。
+3. 若容量不足，选择受害者并释放其 BlockTable。
+4. 重算剩余 Decode 请求的需求，直到可以原子 reserve。
+
+这样 Engine 不会在模型前向完成后才发现 K/V 无处写入。
+
+#### 4. 受害者选择规则
+
+当前策略是：
+
+```text
+优先：尚未产生首 token 的 Prefill 请求
+其次：最新进入 RUNNING 的 Decode 请求
+同类：LIFO，优先保留更早到达的请求
+```
+
+优先抢占 Prefill 是因为它尚未向用户流式输出，不会直接打断正在观察的生成。LIFO 让
+老请求先完成，避免所有请求都缓慢前进但没有任何一个释放资源。
+
+Scheduler 不会抢占本轮已经固定 slots 的 Prefill chunk，否则执行计划会引用已经释放的
+物理块。
+
+#### 5. RECOMPUTE 如何保持生成正确
+
+抢占时执行：
+
+```text
+释放该请求全部物理 KV Blocks
+RUNNING -> WAITING
+num_computed_tokens -> 0
+重算目标 -> Prompt + 已生成 output tokens
+```
+
+已经返回给用户的 output token 不能删除。恢复后，模型重新处理：
+
+```text
+Prompt + output[0] + ... + output[n-1]
+```
+
+最后一个位置的 logits 正好继续预测 `output[n]`。因此重算会浪费计算，但不会改变逻辑
+上下文。
+
+采样随机数生成器也不会重建。重算旧上下文期间不采样，只有恢复到原生成位置后才消费
+下一个随机数。单元测试验证了相同 seed 下：
+
+```text
+充足 Block，无抢占输出 == 紧张 Block，多次重算输出
+```
+
+TTFT 同样使用第一次产生首 token 的时间；Decode 请求重算完成时不会覆盖原 TTFT。
+
+#### 6. 为什么需要重入门槛
+
+第一版抢占后立即把请求放回 WAITING 队首，但下一轮只要有运行槽就重新接纳。4 Block
+压力测试出现：
+
+```text
+请求 B 被抢占 -> 只拿到少量 Block -> 再次被抢占
+平均每次 workload 抢占 10 次
+```
+
+这叫 preemption thrashing，大量时间花在重复计算同一段 Prompt。
+
+现在首次请求仍可增量进入，但被抢占请求只有在：
+
+```text
+free_blocks >= 完整重算目标所需 Blocks
+```
+
+时才能恢复 RUNNING。它会暂时停在 WAITING，让当前高优先级请求尽快完成并释放整个工作
+集。
+
+#### 7. RTX 4060 Ti 压力基准
+
+工作负载：
+
+```text
+4 requests
+Prompt lengths = [32, 48, 32, 48]
+Output limits = [4, 8, 4, 8]
+BS = 2
+Block Size = 16
+```
+
+| Triton 配置 | 总吞吐 tok/s | TTFT P95 ms | TPOT P95 ms | E2E P95 ms | 抢占/轮 |
+|---|---:|---:|---:|---:|---:|
+| 16 Blocks，容量充足 | 222.6 | 599.5 | 51.4 | 828.4 | 0 |
+| 4 Blocks，无重入保护 | 119.6 | 1320.0 | 131.8 | 1538.0 | 10 |
+| 4 Blocks，有重入保护 | 179.6 | 816.7 | 34.0 | 1028.6 | 3 |
+
+4 Blocks 无法同时容纳两个请求的最大上下文，但每条请求单独可以完成。抢占让原本无法
+并发执行的 workload 正确结束；重入保护又把 thrashing 大幅压低。
+
+容量紧张仍有约 19% 的吞吐损失，这是重算成本，不应宣称抢占可以免费扩展显存。它的
+价值是从“直接 OutOfBlocks / 死锁”降级为“降低吞吐但保持系统可前进”。
+
+#### 8. 当前还缺少什么
+
+- 没有把 KV Block 换出到 CPU，只有丢弃后重算
+- 没有请求优先级、截止时间和最大抢占次数
+- 没有按已计算 token 数估算受害者重算成本
+- 在线请求持续到达时还需要更严格的防饥饿策略
+
+下一步可以给 Scheduler 增加显式 priority 与 aging，或实现 CPU swap。对 8 GB 显卡的
+教学项目，RECOMPUTE 比 swap 更简单，也更容易观察计算与显存之间的交换关系。
+
 ### 当前验证结果
 
 ```text
-62 个测试全部通过
+66 个测试全部通过
 Python compileall 通过
 CUDA、BF16、真实权重加载通过
 Tokenizer 普通文本往返和聊天模板测试通过
@@ -2696,6 +2865,7 @@ Triton autotune 四组候选、缓存和基线保护通过
 Engine 已迁移到独立子包，公共导入和真实 CUDA 推理保持兼容
 Chunked Prefill、PD 混合轮、token budget 和不同历史 Batch 已验证
 KV Block 可按真实 GPU 显存、利用率目标和运行余量自动规划
+Prefill/Decode Block 竞争可触发 RECOMPUTE 抢占并避免重算抖动
 ```
 
 ## 当前进度
@@ -2722,5 +2892,6 @@ KV Block 可按真实 GPU 显存、利用率目标和运行余量自动规划
   - [x] 第 10E 步：Engine 子包重构
   - [x] 第 10F 步：Chunked Prefill 与 PD 混合调度
   - [x] 第 10G 步：GPU 显存利用率与 KV Block 自动规划
-  - [ ] 第 10H 步：固定 Batch Decode 的 CUDA Graph 实验
+  - [x] 第 10H 步：Block 不足时的 RECOMPUTE 抢占
+  - [ ] 第 10I 步：固定 Batch Decode 的 CUDA Graph 实验
 - [ ] 第 11 步：HTTP 服务（可选）

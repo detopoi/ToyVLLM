@@ -3,12 +3,163 @@ import unittest
 import torch
 
 from tests.test_layers import tiny_config
-from toyvllm.engine import PagedContinuousBatchEngine
+from toyvllm.engine import OutOfBlocksError, PagedContinuousBatchEngine
 from toyvllm.generation import generate_greedy_cached
 from toyvllm.models.qwen3 import Qwen3ForCausalLM
+from toyvllm.sampling import SamplingParams
 
 
 class PagedContinuousBatchEngineTest(unittest.TestCase):
+    def test_preemption_keeps_sampling_stream_reproducible(self) -> None:
+        torch.manual_seed(4)
+        model = Qwen3ForCausalLM(tiny_config()).eval()
+        prompts = [[1, 2, 3, 4], [5, 6, 7, 8]]
+        params = SamplingParams(
+            temperature=0.8,
+            top_k=5,
+            top_p=0.9,
+            seed=123,
+        )
+
+        outputs = []
+        preemptions = []
+        for num_blocks in (8, 4):
+            engine = PagedContinuousBatchEngine(
+                model,
+                max_num_seqs=2,
+                pad_token_id=0,
+                num_blocks=num_blocks,
+                block_size=2,
+                attention_backend="paged",
+                max_num_batched_tokens=4,
+                max_prefill_chunk_size=2,
+            )
+            for prompt in prompts:
+                engine.add_request(
+                    prompt,
+                    max_new_tokens=3,
+                    eos_token_ids=set(),
+                    sampling_params=params,
+                )
+            result = engine.run()
+            outputs.append(
+                [
+                    sequence.output_token_ids
+                    for sequence in result.sequences
+                ]
+            )
+            preemptions.append(result.total_preemptions)
+
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertEqual(preemptions[0], 0)
+        self.assertGreater(preemptions[1], 0)
+
+    def test_prefill_request_is_preempted_when_blocks_are_contended(self) -> None:
+        torch.manual_seed(2)
+        model = Qwen3ForCausalLM(tiny_config()).eval()
+        prompts = [[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]]
+        expected = [
+            generate_greedy_cached(
+                model,
+                prompt,
+                max_new_tokens=2,
+                eos_token_ids=set(),
+            ).output_token_ids
+            for prompt in prompts
+        ]
+        engine = PagedContinuousBatchEngine(
+            model,
+            max_num_seqs=2,
+            pad_token_id=0,
+            num_blocks=4,
+            block_size=2,
+            attention_backend="paged",
+            max_num_batched_tokens=4,
+            max_prefill_chunk_size=2,
+        )
+        for prompt in prompts:
+            engine.add_request(
+                prompt,
+                max_new_tokens=2,
+                eos_token_ids=set(),
+            )
+        result = engine.run()
+
+        self.assertEqual(
+            [sequence.output_token_ids for sequence in result.sequences],
+            expected,
+        )
+        self.assertEqual(result.sequences[1].preemption_count, 1)
+        self.assertTrue(
+            any(
+                iteration.preempted_request_ids
+                for iteration in result.iterations
+            )
+        )
+        self.assertEqual(engine.block_manager.stats.num_used_blocks, 0)
+
+    def test_decode_preemption_preserves_generated_tokens(self) -> None:
+        torch.manual_seed(3)
+        model = Qwen3ForCausalLM(tiny_config()).eval()
+        prompts = [[1, 2, 3, 4], [5, 6, 7, 8]]
+        expected = [
+            generate_greedy_cached(
+                model,
+                prompt,
+                max_new_tokens=3,
+                eos_token_ids=set(),
+            ).output_token_ids
+            for prompt in prompts
+        ]
+        engine = PagedContinuousBatchEngine(
+            model,
+            max_num_seqs=2,
+            pad_token_id=0,
+            num_blocks=4,
+            block_size=2,
+            attention_backend="paged",
+            max_num_batched_tokens=4,
+            max_prefill_chunk_size=2,
+        )
+        for prompt in prompts:
+            engine.add_request(
+                prompt,
+                max_new_tokens=3,
+                eos_token_ids=set(),
+            )
+        result = engine.run()
+
+        self.assertEqual(
+            [sequence.output_token_ids for sequence in result.sequences],
+            expected,
+        )
+        self.assertEqual(result.sequences[1].preemption_count, 1)
+        self.assertEqual(len(result.request_first_token_seconds), 2)
+        self.assertEqual(engine.block_manager.stats.num_used_blocks, 0)
+
+    def test_request_larger_than_entire_pool_is_rejected(self) -> None:
+        model = Qwen3ForCausalLM(tiny_config()).eval()
+        engine = PagedContinuousBatchEngine(
+            model,
+            max_num_seqs=1,
+            pad_token_id=0,
+            num_blocks=2,
+            block_size=2,
+            attention_backend="paged",
+            max_num_batched_tokens=2,
+            max_prefill_chunk_size=2,
+        )
+        engine.add_request(
+            [1, 2, 3, 4],
+            max_new_tokens=2,
+            eos_token_ids=set(),
+        )
+        with self.assertRaisesRegex(
+            OutOfBlocksError,
+            "即使独占 GPU 也无法完成",
+        ):
+            engine.run()
+
     def test_chunked_prefill_matches_individual_generation(self) -> None:
         torch.manual_seed(0)
         model = Qwen3ForCausalLM(tiny_config()).eval()

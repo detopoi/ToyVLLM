@@ -237,6 +237,30 @@ class BlockManager:
         additional = max(0, required_total - table.num_blocks)
         return additional <= len(self._free_blocks)
 
+    def additional_blocks_required(
+        self,
+        request_id: int,
+        num_new_tokens: int,
+    ) -> int:
+        """返回增长所需的新 Block 数，不修改 Block Table。"""
+
+        if num_new_tokens <= 0:
+            raise ValueError("num_new_tokens 必须大于 0")
+        table = self.get_block_table(request_id)
+        required_total = self._blocks_for_tokens(
+            table.num_tokens + num_new_tokens
+        )
+        return max(0, required_total - table.num_blocks)
+
+    def max_reservable_tokens(self, request_id: int) -> int:
+        """当前空闲块全部给该请求时，它最多还能增长多少 token。"""
+
+        table = self.get_block_table(request_id)
+        total_capacity = (
+            table.num_blocks + len(self._free_blocks)
+        ) * self.block_size
+        return total_capacity - table.num_tokens
+
     def blocks_required_for_tokens(self, num_tokens: int) -> int:
         """公开只读容量计算，供 Scheduler admission 使用。"""
 
