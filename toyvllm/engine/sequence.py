@@ -67,6 +67,8 @@ class Sequence:
     prefill_target_length: int = field(init=False)
     preemption_count: int = 0
     last_preempted_step: int | None = None
+    # 累计记录每次 admission 从 Prefix Cache 恢复的 token，便于 benchmark 观察收益。
+    prefix_cache_hit_tokens: int = 0
 
     def __post_init__(self) -> None:
         if not self.prompt_token_ids:
@@ -118,6 +120,18 @@ class Sequence:
         if new_value > self.prefill_target_length:
             raise ValueError("Prefill 进度不能超过当前重算目标")
         self.num_prompt_tokens_computed = new_value
+
+    def restore_cached_prefix(self, num_tokens: int) -> None:
+        """在 admission 时恢复整块缓存前缀，不执行模型前向。"""
+
+        if num_tokens < 0:
+            raise ValueError("缓存前缀 token 数必须是非负整数")
+        if self.num_prompt_tokens_computed != 0:
+            raise RuntimeError("只有尚未开始 Prefill 的请求可以恢复缓存")
+        if num_tokens >= self.prefill_target_length:
+            raise ValueError("Prefix Cache 必须留下至少一个 token 计算 logits")
+        self.num_prompt_tokens_computed = num_tokens
+        self.prefix_cache_hit_tokens += num_tokens
 
     def preempt_for_recompute(self, *, step: int) -> None:
         """释放 KV Cache 后退回 WAITING，并准备从头重算完整上下文。"""

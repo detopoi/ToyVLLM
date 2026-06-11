@@ -9,6 +9,8 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 
+from toyvllm.engine.prefix_cache import PrefixCache, PrefixCacheStats
+
 
 class OutOfBlocksError(RuntimeError):
     """物理块池容量不足，当前请求不能继续增长。"""
@@ -78,8 +80,15 @@ class BlockTable:
 class BlockManagerStats:
     num_total_blocks: int
     num_free_blocks: int
+    num_allocatable_blocks: int
     num_used_blocks: int
     num_requests: int
+    num_cached_blocks: int = 0
+    num_evictable_cached_blocks: int = 0
+    num_shared_blocks: int = 0
+    num_prefix_cache_hits: int = 0
+    num_prefix_cache_hit_tokens: int = 0
+    num_prefix_cache_evictions: int = 0
 
 
 class BlockManager:
@@ -87,16 +96,20 @@ class BlockManager:
 
     重要不变量：
 
-    - 一个物理块同一时间只属于一条请求；
+    - 普通块只属于一条请求，完整前缀块可以由多条请求只读共享；
     - 请求只按实际增长分配块，不预留最大上下文；
     - reserve 要么完整成功，要么完全不修改 Block Table；
-    - free 后物理块回到空闲队列，可以被后续请求复用。
-
-    当前版本还不实现共享前缀和 Copy-on-Write，所以没有引用计数。共享只表示“请求结束后
-    物理块可被别的请求复用”，不是两条活跃请求同时引用同一块。
+    - free 只减少引用；缓存块会继续驻留，内存紧张时再按 LRU 淘汰；
+    - 只共享完整块，因此后续写入总从新块开始，不需要 Copy-on-Write。
     """
 
-    def __init__(self, num_blocks: int, block_size: int) -> None:
+    def __init__(
+        self,
+        num_blocks: int,
+        block_size: int,
+        *,
+        enable_prefix_cache: bool = False,
+    ) -> None:
         if num_blocks <= 0:
             raise ValueError("num_blocks 必须大于 0")
         if block_size <= 0:
@@ -108,6 +121,12 @@ class BlockManager:
         # 物理块只是整数编号。真实 Tensor 会按相同编号预分配为一个大块池。
         self._free_blocks: deque[int] = deque(range(num_blocks))
         self._tables: dict[int, BlockTable] = {}
+        # ref_count 只统计活跃 Block Table 的引用。Prefix Cache 本身相当于一个“软引用”：
+        # ref_count=0 时 KV 仍驻留，但可以在分配压力下被 LRU 淘汰。
+        self._block_ref_counts = [0] * num_blocks
+        self._prefix_cache = (
+            PrefixCache(block_size) if enable_prefix_cache else None
+        )
 
     def allocate(
         self,
@@ -136,7 +155,7 @@ class BlockManager:
         self._require_free_blocks(required_blocks)
 
         # 容量检查完成后才修改内部状态，保证失败时没有半初始化请求。
-        allocated = tuple(self._free_blocks.popleft() for _ in range(required_blocks))
+        allocated = self._take_blocks(required_blocks)
         table = BlockTable(
             request_id=request_id,
             block_size=self.block_size,
@@ -166,9 +185,7 @@ class BlockManager:
 
         # 先检查、后分配、最后替换不可变 BlockTable。任何异常都不会改变旧映射。
         self._require_free_blocks(additional_blocks)
-        allocated = tuple(
-            self._free_blocks.popleft() for _ in range(additional_blocks)
-        )
+        allocated = self._take_blocks(additional_blocks)
         new_table = BlockTable(
             request_id=request_id,
             block_size=self.block_size,
@@ -221,8 +238,17 @@ class BlockManager:
         except KeyError as error:
             raise KeyError(f"未知 request_id：{request_id}") from error
 
-        # 使用 FIFO 空闲队列。刚释放块放到队尾，所有块会得到较均匀的复用机会。
-        self._free_blocks.extend(table.physical_block_ids)
+        # 共享块不能直接放回空闲队列。最后一条活跃请求结束后，普通块立即回收；
+        # Prefix Cache 块继续保留 K/V，直到缓存被清空或内存压力触发 LRU 淘汰。
+        for block_id in table.physical_block_ids:
+            self._block_ref_counts[block_id] -= 1
+            if self._block_ref_counts[block_id] < 0:
+                raise RuntimeError(f"物理 Block {block_id} 引用计数变成负数")
+            if (
+                self._block_ref_counts[block_id] == 0
+                and not self._is_cached_block(block_id)
+            ):
+                self._free_blocks.append(block_id)
         return table.physical_block_ids
 
     def can_reserve(self, request_id: int, num_new_tokens: int) -> bool:
@@ -235,7 +261,7 @@ class BlockManager:
             table.num_tokens + num_new_tokens
         )
         additional = max(0, required_total - table.num_blocks)
-        return additional <= len(self._free_blocks)
+        return additional <= self._num_allocatable_blocks()
 
     def additional_blocks_required(
         self,
@@ -257,9 +283,125 @@ class BlockManager:
 
         table = self.get_block_table(request_id)
         total_capacity = (
-            table.num_blocks + len(self._free_blocks)
+            table.num_blocks + self._num_allocatable_blocks()
         ) * self.block_size
         return total_capacity - table.num_tokens
+
+    def attach_cached_prefix(
+        self,
+        request_id: int,
+        token_ids: list[int],
+    ) -> int:
+        """把最长连续缓存前缀挂到空 Block Table，返回复用的 token 数。
+
+        最后一个 Prompt token 必须实际执行一次前向，才能得到首个输出 token 的 logits。
+        因此即使整个 Prompt 都由完整块组成，也最多复用“最后一个 token 之前”的完整块。
+        """
+
+        if self._prefix_cache is None:
+            return 0
+        table = self.get_block_table(request_id)
+        if table.num_tokens or table.physical_block_ids:
+            raise RuntimeError("只有空 Block Table 可以挂载 Prefix Cache")
+
+        max_cacheable_tokens = max(0, len(token_ids) - 1)
+        block_ids: list[int] = []
+        matched_tokens = 0
+        for key, _, block_tokens, end in self._prefix_cache.iter_full_blocks(
+            token_ids,
+            max_tokens=max_cacheable_tokens,
+        ):
+            entry = self._prefix_cache.get(
+                key,
+                block_tokens,
+                record_hit=True,
+            )
+            if entry is None:
+                break
+            block_ids.append(entry.block_id)
+            self._block_ref_counts[entry.block_id] += 1
+            matched_tokens = end
+
+        if block_ids:
+            self._tables[request_id] = BlockTable(
+                request_id=request_id,
+                block_size=self.block_size,
+                physical_block_ids=tuple(block_ids),
+                num_tokens=matched_tokens,
+            )
+        return matched_tokens
+
+    def cached_prefix_tokens(self, token_ids: list[int]) -> int:
+        """只预览最长可复用前缀，不修改引用计数和命中统计。"""
+
+        if self._prefix_cache is None:
+            return 0
+        matched_tokens = 0
+        for key, _, block_tokens, end in self._prefix_cache.iter_full_blocks(
+            token_ids,
+            max_tokens=max(0, len(token_ids) - 1),
+        ):
+            if self._prefix_cache.get(
+                key,
+                block_tokens,
+                record_hit=False,
+            ) is None:
+                break
+            matched_tokens = end
+        return matched_tokens
+
+    def cache_computed_prompt_blocks(
+        self,
+        request_id: int,
+        prompt_token_ids: list[int],
+    ) -> int:
+        """登记已经完成计算的 Prompt 整块，返回本次新增缓存块数。
+
+        Engine 必须在 K/V 写回 GPU 之后调用本方法。BlockManager 只验证 Block Table
+        的有效长度，无法自行判断真实 Tensor 是否已经完成写入。
+        """
+
+        if self._prefix_cache is None:
+            return 0
+        table = self.get_block_table(request_id)
+        max_tokens = min(table.num_tokens, len(prompt_token_ids))
+        inserted = 0
+        for logical_block_id, (
+            key,
+            parent_key,
+            block_tokens,
+            _,
+        ) in enumerate(
+            self._prefix_cache.iter_full_blocks(
+                prompt_token_ids,
+                max_tokens=max_tokens,
+            )
+        ):
+            existing = self._prefix_cache.get(
+                key,
+                block_tokens,
+                record_hit=False,
+            )
+            if existing is not None:
+                continue
+            block_id = table.physical_block_ids[logical_block_id]
+            if self._prefix_cache.insert(
+                key=key,
+                parent_key=parent_key,
+                token_ids=block_tokens,
+                block_id=block_id,
+            ):
+                inserted += 1
+        return inserted
+
+    def clear_prefix_cache(self) -> None:
+        """移除全部缓存索引；没有活跃引用的物理块立即回到空闲队列。"""
+
+        if self._prefix_cache is None:
+            return
+        for entry in self._prefix_cache.clear():
+            if self._block_ref_counts[entry.block_id] == 0:
+                self._free_blocks.append(entry.block_id)
 
     def blocks_required_for_tokens(self, num_tokens: int) -> int:
         """公开只读容量计算，供 Scheduler admission 使用。"""
@@ -281,11 +423,29 @@ class BlockManager:
     @property
     def stats(self) -> BlockManagerStats:
         free = len(self._free_blocks)
+        cache_stats = self.prefix_cache_stats
         return BlockManagerStats(
             num_total_blocks=self.num_blocks,
             num_free_blocks=free,
+            num_allocatable_blocks=self._num_allocatable_blocks(),
             num_used_blocks=self.num_blocks - free,
             num_requests=len(self._tables),
+            num_cached_blocks=cache_stats.num_cached_blocks,
+            num_evictable_cached_blocks=cache_stats.num_evictable_blocks,
+            num_shared_blocks=sum(
+                count > 1 for count in self._block_ref_counts
+            ),
+            num_prefix_cache_hits=cache_stats.num_hits,
+            num_prefix_cache_hit_tokens=cache_stats.num_hit_tokens,
+            num_prefix_cache_evictions=cache_stats.num_evictions,
+        )
+
+    @property
+    def prefix_cache_stats(self) -> PrefixCacheStats:
+        if self._prefix_cache is None:
+            return PrefixCacheStats(0, 0, 0, 0, 0)
+        return self._prefix_cache.stats(
+            lambda block_id: self._block_ref_counts[block_id] == 0
         )
 
     def _blocks_for_tokens(self, num_tokens: int) -> int:
@@ -293,8 +453,40 @@ class BlockManager:
         return (num_tokens + self.block_size - 1) // self.block_size
 
     def _require_free_blocks(self, required_blocks: int) -> None:
-        available = len(self._free_blocks)
+        available = self._num_allocatable_blocks()
         if required_blocks > available:
             raise OutOfBlocksError(
-                f"KV Block 不足：需要 {required_blocks}，空闲 {available}"
+                f"KV Block 不足：需要 {required_blocks}，可分配 {available}"
             )
+        while len(self._free_blocks) < required_blocks:
+            if self._prefix_cache is None:
+                raise RuntimeError("可分配块统计与空闲队列不一致")
+            entry = self._prefix_cache.evict_one(
+                lambda block_id: self._block_ref_counts[block_id] == 0
+            )
+            if entry is None:
+                raise RuntimeError("Prefix Cache 没有可淘汰块")
+            self._free_blocks.append(entry.block_id)
+
+    def _take_blocks(self, count: int) -> tuple[int, ...]:
+        self._require_free_blocks(count)
+        block_ids = tuple(self._free_blocks.popleft() for _ in range(count))
+        for block_id in block_ids:
+            if self._block_ref_counts[block_id] != 0:
+                raise RuntimeError(f"分配到仍有引用的物理 Block {block_id}")
+            self._block_ref_counts[block_id] = 1
+        return block_ids
+
+    def _is_cached_block(self, block_id: int) -> bool:
+        return (
+            self._prefix_cache is not None
+            and self._prefix_cache.contains_block(block_id)
+        )
+
+    def _num_allocatable_blocks(self) -> int:
+        available = len(self._free_blocks)
+        if self._prefix_cache is not None:
+            available += self._prefix_cache.count_evictable(
+                lambda block_id: self._block_ref_counts[block_id] == 0
+            )
+        return available

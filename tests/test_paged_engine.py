@@ -10,6 +10,45 @@ from toyvllm.sampling import SamplingParams
 
 
 class PagedContinuousBatchEngineTest(unittest.TestCase):
+    def test_prefix_cache_reuses_prompt_blocks_without_changing_output(self) -> None:
+        torch.manual_seed(5)
+        model = Qwen3ForCausalLM(tiny_config()).eval()
+        prompt = [1, 2, 3, 4, 5]
+        engine = PagedContinuousBatchEngine(
+            model,
+            max_num_seqs=1,
+            pad_token_id=0,
+            num_blocks=8,
+            block_size=2,
+            attention_backend="paged",
+            max_num_batched_tokens=4,
+            max_prefill_chunk_size=4,
+            enable_prefix_cache=True,
+        )
+
+        engine.add_request(prompt, max_new_tokens=2, eos_token_ids=set())
+        while not engine.scheduler.is_done:
+            engine.step()
+
+        engine.add_request(prompt, max_new_tokens=2, eos_token_ids=set())
+        result = engine.run()
+        first, second = result.sequences
+
+        self.assertEqual(first.output_token_ids, second.output_token_ids)
+        self.assertEqual(first.prefix_cache_hit_tokens, 0)
+        self.assertEqual(second.prefix_cache_hit_tokens, 4)
+        self.assertEqual(result.total_prefix_cache_hit_tokens, 4)
+        second_prefill_tokens = sum(
+            count
+            for iteration in result.iterations
+            for request_id, count in zip(
+                iteration.prefill_request_ids,
+                iteration.prefill_token_counts,
+            )
+            if request_id == second.request_id
+        )
+        self.assertEqual(second_prefill_tokens, 1)
+
     def test_preemption_keeps_sampling_stream_reproducible(self) -> None:
         torch.manual_seed(4)
         model = Qwen3ForCausalLM(tiny_config()).eval()

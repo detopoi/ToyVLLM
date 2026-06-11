@@ -169,6 +169,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="已有 Decode 时，同轮 Prefill token 总上限；默认仍使用剩余总预算",
     )
     continuous_parser.add_argument(
+        "--enable-prefix-cache",
+        action="store_true",
+        help="复用相同完整 Prompt block 的 KV；需要同时启用 Chunked Prefill",
+    )
+    continuous_parser.add_argument(
         "--paged-attention",
         choices=(
             "auto",
@@ -287,6 +292,13 @@ def main() -> None:
         return
 
     if args.command == "continuous":
+        if args.enable_prefix_cache and args.cache_backend != "paged":
+            raise ValueError("Prefix Cache 只支持 paged 缓存后端")
+        if args.enable_prefix_cache and args.max_num_batched_tokens is None:
+            raise ValueError(
+                "Prefix Cache 依赖 Chunked Prefill，"
+                "请设置 --max-num-batched-tokens"
+            )
         config = ModelConfig.from_pretrained(args.model)
         tokenizer = Tokenizer(args.model)
         sampling_params = resolve_sampling_params(args, config)
@@ -304,6 +316,7 @@ def main() -> None:
                 max_num_batched_tokens=args.max_num_batched_tokens,
                 max_prefill_chunk_size=args.max_prefill_chunk_size,
                 max_mixed_prefill_tokens=args.max_mixed_prefill_tokens,
+                enable_prefix_cache=args.enable_prefix_cache,
             )
         else:
             engine = ContinuousBatchEngine(
@@ -340,6 +353,10 @@ def main() -> None:
                     f"{engine.kv_cache_capacity_plan.format()}"
                 )
             print(f"Paged Attention：{engine.attention_backend}")
+            print(
+                "Prefix Cache："
+                f"{'enabled' if engine.enable_prefix_cache else 'disabled'}"
+            )
             if engine.chunked_prefill_enabled:
                 print(
                     "Chunked Prefill："
@@ -353,13 +370,21 @@ def main() -> None:
         print(f"总输出吞吐：{result.output_tokens_per_second:.2f} tokens/s")
         print(f"请求吞吐：{result.requests_per_second:.2f} requests/s")
         print(f"抢占次数：{result.total_preemptions}")
+        print(f"Prefix Cache 命中 token：{result.total_prefix_cache_hit_tokens}")
         print(f"完成顺序：{list(result.completion_order)}")
         print(f"峰值显存：{result.peak_memory_mib:.1f} MiB")
         if args.cache_backend == "paged":
+            cache_stats = engine.block_manager.prefix_cache_stats
             print(
                 "结束后空闲 Blocks："
                 f"{engine.block_manager.stats.num_free_blocks}/"
                 f"{engine.block_manager.stats.num_total_blocks}"
+            )
+            print(
+                "Prefix Cache Blocks："
+                f"{cache_stats.num_cached_blocks} "
+                f"(可淘汰 {cache_stats.num_evictable_blocks}, "
+                f"淘汰 {cache_stats.num_evictions})"
             )
 
         if args.show_schedule:
@@ -377,6 +402,7 @@ def main() -> None:
             print(
                 f"\n[{sequence.request_id}] "
                 f"preemptions={sequence.preemption_count} "
+                f"prefix_hit_tokens={sequence.prefix_cache_hit_tokens} "
                 f"{args.prompts[sequence.request_id]}"
             )
             print(

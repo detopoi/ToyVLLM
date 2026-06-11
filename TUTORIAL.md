@@ -2838,10 +2838,215 @@ Block Size = 16
 下一步可以给 Scheduler 增加显式 priority 与 aging，或实现 CPU swap。对 8 GB 显卡的
 教学项目，RECOMPUTE 比 swap 更简单，也更容易观察计算与显存之间的交换关系。
 
+### 2026-06-12：第 10I 步，整块 Prefix Cache
+
+许多在线请求会重复很长的公共前缀，例如同一份 system prompt、工具说明、代码仓库
+上下文或多轮对话历史。普通 KV Cache 只避免一条请求在 Decode 时重算自己的历史；
+请求结束后，其 Block 原本会立即回到空闲队列。Prefix Cache 进一步让后续请求复用前一
+条请求已经算好的 Prompt K/V。
+
+本阶段新增：
+
+- `toyvllm/engine/prefix_cache.py`：前缀哈希链、缓存索引和 LRU 顺序
+- `BlockManager`：物理块引用计数、共享挂载、延迟回收和压力淘汰
+- `Scheduler`：admission 时恢复最长缓存前缀
+- `Engine`：K/V 写回成功后发布完整 Prompt block
+- `bench.py --backend prefix`：同一 Engine 的冷/热请求对比
+
+#### 1. 为什么只缓存完整 Block
+
+Block Size 为 16 时，一个物理块包含 16 个连续 token 的全部层 K/V。Prefix Cache 只
+共享已经写满的块：
+
+```text
+Prompt: [block 0: 16 tokens] [block 1: 16 tokens] [tail: 7 tokens]
+可共享: block 0, block 1
+不可共享: tail
+```
+
+若共享只有 7 个 token 的半块，热请求继续向同一物理块写第 8 个 token 时，可能覆盖仍
+被其他请求引用的数据。生产引擎可以用 Copy-on-Write 解决，但教学版先坚持一个简单
+不变量：
+
+```text
+共享块永远只读；新 token 从新的物理块开始写。
+```
+
+这样 Prefix Cache 可以直接复用现有 Block Table 和 PagedKVCache，不需要复制 GPU
+Tensor。
+
+#### 2. 为什么 key 不能只看当前 block
+
+假设两个 Prompt 都出现 token block `[3, 4]`：
+
+```text
+A = [1, 2] [3, 4]
+B = [8, 9] [3, 4]
+```
+
+第二块 token 相同，但它们前面的上下文不同，Attention 得到的 K/V 也不能视为同一个
+前缀位置。当前实现使用链式 SHA-256：
+
+```text
+key_0 = SHA256(ROOT  + tokens_of_block_0)
+key_1 = SHA256(key_0 + tokens_of_block_1)
+key_2 = SHA256(key_1 + tokens_of_block_2)
+```
+
+因此第 N 块的 key 隐含了前面所有块。查找也必须从 block 0 连续命中，遇到第一个 miss
+立即停止，不能跳到中间继续复用。
+
+缓存项还保留原始 block token，并在摘要命中后再次比较，避免正确性依赖哈希“绝不
+碰撞”的概率假设。
+
+#### 3. 冷请求如何发布缓存
+
+Chunked Prefill 的顺序变为：
+
+```text
+Scheduler.reserve 本轮 slots
+        ↓
+Model 计算本轮 K/V
+        ↓
+PagedKVCache.write 写入 GPU 物理块
+        ↓
+Sequence.advance_prefill 提交有效长度
+        ↓
+BlockManager.cache_computed_prompt_blocks 发布新写满的块
+```
+
+发布动作必须放在 GPU K/V 写回之后。若先把元数据放入 Prefix Cache，另一个请求可能
+命中一个仍未写完的物理块。
+
+部分 chunk 只会发布其中已经完整写满的块，尾部半块继续由原请求独占。
+
+#### 4. 热请求如何恢复
+
+新请求进入 RUNNING 时仍先创建空 Block Table：
+
+```text
+physical_block_ids = ()
+num_tokens = 0
+```
+
+`attach_cached_prefix()` 从 Prompt 开头查找最长完整前缀，把命中的物理块号直接放入新
+请求的 Block Table，并增加这些物理块的活跃引用计数：
+
+```text
+冷请求 Block Table: [17, 42, 9]
+热请求 Block Table: [17, 42] + 后续新分配块
+```
+
+两条请求可以同时只读引用 17 和 42，无需拷贝 K/V。Sequence 的
+`num_prompt_tokens_computed` 同步前移，Scheduler 后续只为未命中的尾部安排 Prefill。
+
+#### 5. 为什么不能把整个相同 Prompt 都跳过
+
+KV Cache 保存 Key 和 Value，但没有保存最后位置用于预测首 token 的 logits。若一个
+512-token Prompt 的 32 个块全部跳过，Engine 没有任何本轮 logits 可供采样。
+
+因此查找规则是：
+
+```text
+最多复用“最后一个 Prompt token 之前”的完整块
+```
+
+Block Size 16 时：
+
+```text
+Prompt 512 tokens -> 复用 496，重算最后 16
+Prompt 513 tokens -> 复用 512，重算最后 1
+```
+
+冷请求仍可登记第 32 个完整块。它对相同的 512-token Prompt 不能全部跳过，但可以被
+以这 512 token 开头的更长 Prompt 完整复用。
+
+#### 6. 引用计数与 LRU 如何协作
+
+每个物理块现在有一个活跃引用计数：
+
+```text
+ref_count > 1 : 多条运行请求共享，绝不能淘汰
+ref_count = 1 : 至少一条运行请求使用，绝不能淘汰
+ref_count = 0 且在 Prefix Cache 中 : K/V 驻留，可被热请求命中，也可被 LRU 淘汰
+ref_count = 0 且不在 Prefix Cache 中 : 真正 free block
+```
+
+所以“请求结束”不再必然等于“物理块立即 free”。缓存块会保留到显存有压力时，
+`_require_free_blocks()` 才按 LRU 找最久未使用且 `ref_count=0` 的块：
+
+```text
+Prefix Cache 删除索引 -> 物理块进入 free queue -> 分配给新请求
+```
+
+Scheduler 的容量判断也从只看 `num_free_blocks` 改为看：
+
+```text
+num_allocatable_blocks = free blocks + 可淘汰缓存 blocks
+```
+
+否则它会在 LRU 明明能够腾出空间时错误地抢占运行请求。
+
+#### 7. 与 RECOMPUTE 抢占的关系
+
+被抢占请求会丢掉自己的 Block Table，但公共 Prompt 块仍可能留在 Prefix Cache。它
+重新 admission 时先恢复缓存前缀，只重算：
+
+```text
+未命中的 Prompt 尾部 + 已生成 output tokens
+```
+
+重入门槛计算所需新块时也会扣除可复用的 Prompt blocks。这让 Prefix Cache 不只是优化
+重复用户请求，也能降低被抢占请求的重算成本。
+
+#### 8. 启动和 Benchmark
+
+普通命令显式开启：
+
+```powershell
+& $PYTHON -m toyvllm continuous --cache-backend paged `
+    --enable-prefix-cache --max-num-batched-tokens 512 `
+    --max-prefill-chunk-size 256 `
+    "重复的长 Prompt"
+```
+
+Prefix Cache 依赖 Chunked Prefill。原因是热请求恢复后只剩 Prompt 尾部需要计算，完整
+Prefill 路径没有“从中间接着算”的执行契约。
+
+冷/热专用基准：
+
+```powershell
+& $PYTHON bench.py --backend prefix --prefix-prompt-length 513 `
+    --max-new-tokens 8 --warmup 1 --iterations 3 `
+    --max-num-batched-tokens 512 --max-prefill-chunk-size 256 `
+    --save benchmarks/results.jsonl
+```
+
+RTX 4060 Ti、Qwen3-1.7B、BF16 实测：
+
+| 指标 | 冷请求 | 热请求 | 提升 |
+|---|---:|---:|---:|
+| 实际 Prefill token | 513 | 1 | 跳过 512 |
+| TTFT | 354.58 ms | 41.80 ms | 8.48x |
+| 8-token E2E | 1340.45 ms | 238.18 ms | 5.63x |
+
+缓存中保留 32 个完整 Blocks，没有发生淘汰。冷、热请求的输出 token 完全一致。
+
+#### 9. 当前边界
+
+- 只缓存 Prompt 完整块，不缓存生成中的 output blocks
+- 缓存只在一个 Engine 实例和同一份模型权重生命周期内有效
+- 同一调度轮同时进入的重复请求可能都先 miss，下一轮到达的请求才能命中
+- 没有跨进程共享、持久化或 CPU 缓存层
+- 没有 Copy-on-Write，所以半块不能共享
+- LRU 只按最近访问排序，没有结合重算成本和前缀热门程度
+
+这些限制保留了核心机制，同时让 Prefix Cache 的正确性仍能在 CPU 单元测试中独立验证。
+
 ### 当前验证结果
 
 ```text
-66 个测试全部通过
+72 个测试全部通过
 Python compileall 通过
 CUDA、BF16、真实权重加载通过
 Tokenizer 普通文本往返和聊天模板测试通过
@@ -2866,6 +3071,7 @@ Engine 已迁移到独立子包，公共导入和真实 CUDA 推理保持兼容
 Chunked Prefill、PD 混合轮、token budget 和不同历史 Batch 已验证
 KV Block 可按真实 GPU 显存、利用率目标和运行余量自动规划
 Prefill/Decode Block 竞争可触发 RECOMPUTE 抢占并避免重算抖动
+Prefix Cache 整块共享、引用计数、LRU 淘汰和真实冷/热收益已验证
 ```
 
 ## 当前进度
@@ -2893,5 +3099,6 @@ Prefill/Decode Block 竞争可触发 RECOMPUTE 抢占并避免重算抖动
   - [x] 第 10F 步：Chunked Prefill 与 PD 混合调度
   - [x] 第 10G 步：GPU 显存利用率与 KV Block 自动规划
   - [x] 第 10H 步：Block 不足时的 RECOMPUTE 抢占
-  - [ ] 第 10I 步：固定 Batch Decode 的 CUDA Graph 实验
+  - [x] 第 10I 步：整块 Prefix Cache、引用计数与 LRU 淘汰
+  - [ ] 第 10J 步：固定 Batch Decode 的 CUDA Graph 实验
 - [ ] 第 11 步：HTTP 服务（可选）
