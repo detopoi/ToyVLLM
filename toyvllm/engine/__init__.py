@@ -22,6 +22,11 @@ if TYPE_CHECKING:
         EngineIteration,
         PagedContinuousBatchEngine,
     )
+    from toyvllm.engine.memory_planner import (
+        KVCacheCapacityPlan,
+        calculate_kv_cache_capacity,
+        plan_kv_cache_capacity,
+    )
     from toyvllm.engine.scheduler import PagedScheduler, ScheduledPrefill, Scheduler
     from toyvllm.engine.sequence import FinishReason, Sequence, SequenceStatus
 
@@ -33,6 +38,7 @@ __all__ = [
     "ContinuousBatchResult",
     "EngineIteration",
     "FinishReason",
+    "KVCacheCapacityPlan",
     "OutOfBlocksError",
     "PagedScheduler",
     "PagedContinuousBatchEngine",
@@ -41,6 +47,8 @@ __all__ = [
     "Scheduler",
     "Sequence",
     "SequenceStatus",
+    "calculate_kv_cache_capacity",
+    "plan_kv_cache_capacity",
 ]
 
 
@@ -70,6 +78,14 @@ def __getattr__(name: str) -> Any:
         from toyvllm.engine import scheduler
 
         return getattr(scheduler, name)
+    if name in {
+        "KVCacheCapacityPlan",
+        "calculate_kv_cache_capacity",
+        "plan_kv_cache_capacity",
+    }:
+        from toyvllm.engine import memory_planner
+
+        return getattr(memory_planner, name)
     if name in {"FinishReason", "Sequence", "SequenceStatus"}:
         from toyvllm.engine import sequence
 

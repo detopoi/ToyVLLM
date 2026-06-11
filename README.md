@@ -151,6 +151,18 @@ Windows 环境安装本项目验证过的 Triton：
     "你好" "解释 KV Cache" "描述夏天"
 ```
 
+不传 `--num-kv-blocks` 时，Engine 会在模型加载完成后根据真实空闲显存自动规划 KV
+Block。默认目标 GPU 利用率为 85%，并额外保留 1024 MiB 给激活和临时 Tensor：
+
+```powershell
+& $PYTHON -m toyvllm continuous --cache-backend paged `
+    --gpu-memory-utilization 0.85 `
+    --kv-cache-runtime-reserve-mib 1024 `
+    --paged-attention triton "你好" "解释 KV Cache"
+```
+
+需要严格复现实验容量时仍可传 `--num-kv-blocks 256` 手动覆盖。
+
 启用 Chunked Prefill 和 PD 混合调度：
 
 ```powershell

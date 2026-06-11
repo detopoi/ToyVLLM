@@ -12,6 +12,10 @@ from dataclasses import dataclass
 import torch
 
 from toyvllm.engine.block_manager import BlockManager, OutOfBlocksError
+from toyvllm.engine.memory_planner import (
+    KVCacheCapacityPlan,
+    plan_kv_cache_capacity,
+)
 from toyvllm.kv_cache import PagedKVCache
 from toyvllm.layers.attention import KVCache
 from toyvllm.models.qwen3 import Qwen3ForCausalLM
@@ -526,8 +530,10 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
         *,
         max_num_seqs: int,
         pad_token_id: int,
-        num_blocks: int,
+        num_blocks: int | None = None,
         block_size: int = 16,
+        gpu_memory_utilization: float = 0.85,
+        kv_cache_runtime_reserve_mib: int = 1024,
         attention_backend: str = "paged",
         vectorized_decode_write: bool = True,
         resident_block_tables: bool = True,
@@ -542,6 +548,21 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
         )
         config = model.config
         parameter = next(model.parameters())
+        self.kv_cache_capacity_plan: KVCacheCapacityPlan | None = None
+        if num_blocks is None:
+            self.kv_cache_capacity_plan = plan_kv_cache_capacity(
+                model,
+                block_size=block_size,
+                max_num_seqs=max_num_seqs,
+                gpu_memory_utilization=gpu_memory_utilization,
+                runtime_reserve_mib=kv_cache_runtime_reserve_mib,
+            )
+            num_blocks = self.kv_cache_capacity_plan.num_blocks
+        elif num_blocks <= 0:
+            raise ValueError("num_blocks 必须大于 0，或使用 None 自动规划")
+        self.num_blocks = num_blocks
+        self.gpu_memory_utilization = gpu_memory_utilization
+        self.kv_cache_runtime_reserve_mib = kv_cache_runtime_reserve_mib
         self.block_manager = BlockManager(
             num_blocks=num_blocks,
             block_size=block_size,

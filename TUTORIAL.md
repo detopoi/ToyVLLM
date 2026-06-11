@@ -2555,10 +2555,124 @@ TPOT P95 从 `29.5 ms` 增加到 `92.1 ms`，不能隐藏。完整 Prefill 的 T
 下一步最有价值的是多 token Paged Prefill Kernel：直接按 BlockTable 读取历史，避免每个
 chunk gather 连续 KV；之后再考虑把 Decode token 与 Prefill token 打包成统一执行计划。
 
+### 2026-06-12：第 10G 步，根据 GPU 显存自动规划 KV Block
+
+此前所有 Paged Engine 都要求手动指定：
+
+```text
+--num-kv-blocks 256
+```
+
+这个数字过小时，模型虽然能运行，但大量显存没有转化为可服务的上下文容量；数字过大时，
+KV 池会在 Engine 初始化时一次性申请失败，或者只剩很少显存给 Prefill 激活，首次请求
+才 OOM。
+
+#### 1. 为什么必须在模型加载后规划
+
+不能只读取显卡标称 8 GB，然后减去配置文件里的权重大小。真实占用还包括：
+
+- CUDA Context 和库工作区
+- PyTorch allocator 当前保留的显存
+- RoPE buffer 等非权重 Tensor
+- Windows 桌面和其他 GPU 进程
+- 当前模型实际 dtype 与权重共享方式
+
+因此规划发生在真实权重加载完成后。Engine 先调用：
+
+```python
+torch.cuda.empty_cache()
+free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+```
+
+`empty_cache()` 只释放 allocator 中没有活跃 Tensor 引用的缓存，不会释放模型权重。
+随后得到的是当前时刻整块 GPU 的真实 free/total 快照，其他程序占用也会被计算进去。
+
+#### 2. 预算公式
+
+```text
+target_used = total_memory × gpu_memory_utilization
+current_used = total_memory - free_memory
+cache_budget = target_used - current_used - runtime_reserve
+num_blocks = floor(cache_budget / bytes_per_physical_block)
+```
+
+其中：
+
+- `gpu_memory_utilization`：允许模型、KV Cache 等占用的 GPU 总显存比例
+- `runtime_reserve`：目标比例内部，专门留给激活、SDPA workspace 和临时 Tensor
+- 未进入 utilization 的剩余显存：最后一道 OOM 缓冲
+
+这两层余量不能混为一谈。若只设置 85% 利用率却把其中所有剩余空间都分给 KV Cache，
+Prefill 时的临时 Tensor 会把实际峰值继续推高。
+
+Qwen3-1.7B、BF16、Block Size 16 的单 Block 大小仍是：
+
+```text
+28 layers × 2(K/V) × 16 tokens × 8 KV heads × 128 dim × 2 bytes
+= 1.75 MiB
+```
+
+规划器还会计入常驻 GPU BlockTable 每个物理块增加的 `max_num_seqs × 4 bytes`。这个值
+很小，但公式应保持完整。
+
+#### 3. 自动与手动模式
+
+默认自动：
+
+```powershell
+--gpu-memory-utilization 0.85
+--kv-cache-runtime-reserve-mib 1024
+```
+
+手动覆盖：
+
+```powershell
+--num-kv-blocks 256
+```
+
+只要显式传入 `num_kv_blocks`，Engine 就不执行自动规划。这样历史 benchmark 可以固定
+容量复现，而普通启动不再需要猜 Block 数。
+
+#### 4. RTX 4060 Ti 实测
+
+测试时系统已有桌面和其他 GPU 占用，规划输出为：
+
+```text
+利用率目标=85%
+当前占用=5028.5 MiB
+运行余量=1024.0 MiB
+KV预算=906.9 MiB
+Blocks=518
+```
+
+最终容量：
+
+```text
+518 blocks × 16 tokens = 8288 token slots
+```
+
+相比之前常用的 256 blocks，缓存容量增加约 `2.02 倍`。真实 Qwen3-1.7B Triton 推理
+通过，结束后 518/518 Block 全部回收。BS8 长上下文压力测试中 Gather 路径峰值约
+`5838 MiB`，没有 OOM。
+
+规划结果会随桌面程序和其他 GPU 进程变化，这是正确行为，不是结果不稳定。例如另一个
+程序占用 1 GB 后，Engine 应自动减少 KV Block，而不是继续按显卡标称容量强行分配。
+
+#### 5. 参数如何调整
+
+- 一般使用默认 `0.85 + 1024 MiB`
+- 上下文容量不够且工作负载 Prefill 较短：逐步提高 utilization，例如 0.88
+- 长 Prompt、大 Prefill Batch 或 Gather 路径：增加 runtime reserve
+- 出现初始化 OOM：降低 utilization
+- 初始化成功但首次 Prefill OOM：增加 runtime reserve
+
+当前算法是简单的后加载静态规划，还没有像完整 vLLM 那样运行一次最大形状 profile 来
+测量真实峰值激活。因此余量仍是显式参数，不能承诺任意输入形状绝不 OOM。
+
 ### 当前验证结果
 
 ```text
-58 个测试全部通过
+62 个测试全部通过
 Python compileall 通过
 CUDA、BF16、真实权重加载通过
 Tokenizer 普通文本往返和聊天模板测试通过
@@ -2581,6 +2695,7 @@ Triton autotune 四组候选、缓存和基线保护通过
 长上下文 Serving 基准已记录 TTFT、TPOT、E2E、吞吐和显存
 Engine 已迁移到独立子包，公共导入和真实 CUDA 推理保持兼容
 Chunked Prefill、PD 混合轮、token budget 和不同历史 Batch 已验证
+KV Block 可按真实 GPU 显存、利用率目标和运行余量自动规划
 ```
 
 ## 当前进度
@@ -2606,5 +2721,6 @@ Chunked Prefill、PD 混合轮、token budget 和不同历史 Batch 已验证
   - [x] 第 10D 步：长上下文 Serving 吞吐与时延总基线
   - [x] 第 10E 步：Engine 子包重构
   - [x] 第 10F 步：Chunked Prefill 与 PD 混合调度
-  - [ ] 第 10G 步：固定 Batch Decode 的 CUDA Graph 实验
+  - [x] 第 10G 步：GPU 显存利用率与 KV Block 自动规划
+  - [ ] 第 10H 步：固定 Batch Decode 的 CUDA Graph 实验
 - [ ] 第 11 步：HTTP 服务（可选）

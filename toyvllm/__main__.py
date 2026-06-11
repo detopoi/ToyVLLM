@@ -128,8 +128,25 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("continuous", "paged"),
         default="continuous",
     )
-    continuous_parser.add_argument("--num-kv-blocks", type=int, default=64)
+    continuous_parser.add_argument(
+        "--num-kv-blocks",
+        type=int,
+        default=None,
+        help="物理 KV Block 数；默认根据 GPU 显存自动规划",
+    )
     continuous_parser.add_argument("--block-size", type=int, default=16)
+    continuous_parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.85,
+        help="自动规划时允许模型、KV Cache 等使用的 GPU 总显存比例",
+    )
+    continuous_parser.add_argument(
+        "--kv-cache-runtime-reserve-mib",
+        type=int,
+        default=1024,
+        help="自动规划时额外留给激活和临时 Tensor 的显存",
+    )
     continuous_parser.add_argument(
         "--max-num-batched-tokens",
         type=int,
@@ -281,6 +298,8 @@ def main() -> None:
                 pad_token_id=tokenizer.pad_token_id,
                 num_blocks=args.num_kv_blocks,
                 block_size=args.block_size,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+                kv_cache_runtime_reserve_mib=args.kv_cache_runtime_reserve_mib,
                 attention_backend=args.paged_attention,
                 max_num_batched_tokens=args.max_num_batched_tokens,
                 max_prefill_chunk_size=args.max_prefill_chunk_size,
@@ -311,9 +330,15 @@ def main() -> None:
         print(f"缓存后端：{args.cache_backend}")
         if args.cache_backend == "paged":
             print(
-                f"KV Blocks：{args.num_kv_blocks} × "
-                f"{args.block_size} tokens"
+                f"KV Blocks：{engine.num_blocks} × "
+                f"{args.block_size} tokens = "
+                f"{engine.num_blocks * args.block_size} token slots"
             )
+            if engine.kv_cache_capacity_plan is not None:
+                print(
+                    "自动显存规划："
+                    f"{engine.kv_cache_capacity_plan.format()}"
+                )
             print(f"Paged Attention：{engine.attention_backend}")
             if engine.chunked_prefill_enabled:
                 print(
