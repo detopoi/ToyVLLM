@@ -3,9 +3,29 @@ from __future__ import annotations
 """请求调度器：只管理状态和运行槽位，不执行网络。"""
 
 from collections import deque
+from dataclasses import dataclass
 
-from toyvllm.sampling import SamplingParams
+from toyvllm.engine.block_manager import (
+    BlockManager,
+    BlockTable,
+    OutOfBlocksError,
+    PhysicalTokenSlot,
+)
 from toyvllm.engine.sequence import FinishReason, Sequence, SequenceStatus
+from toyvllm.sampling import SamplingParams
+
+
+@dataclass(frozen=True)
+class ScheduledPrefill:
+    """Scheduler 为一次 Prompt chunk 固定下来的控制面计划。"""
+
+    sequence: Sequence
+    history_table: BlockTable
+    slots: tuple[PhysicalTokenSlot, ...]
+
+    @property
+    def num_tokens(self) -> int:
+        return len(self.slots)
 
 
 class Scheduler:
@@ -75,6 +95,26 @@ class Scheduler:
         return tuple(self._running.values())
 
     @property
+    def prefilling(self) -> tuple[Sequence, ...]:
+        """已经占用运行槽，但 Prompt 尚未全部写入 KV Cache 的请求。"""
+
+        return tuple(
+            sequence
+            for sequence in self._running.values()
+            if not sequence.is_prefill_complete
+        )
+
+    @property
+    def decoding(self) -> tuple[Sequence, ...]:
+        """已经产生首 token、下一轮可以执行单 token Decode 的请求。"""
+
+        return tuple(
+            sequence
+            for sequence in self._running.values()
+            if sequence.is_prefill_complete
+        )
+
+    @property
     def finished(self) -> tuple[Sequence, ...]:
         return tuple(self._finished.values())
 
@@ -129,6 +169,8 @@ class Scheduler:
 
         if sequence.request_id not in self._running:
             raise RuntimeError("请求不在 RUNNING 集合中")
+        if not sequence.is_prefill_complete:
+            raise RuntimeError("Prompt 尚未完成 Prefill，不能提交生成 token")
 
         finish_reason = sequence.append_token(token_id)
         if finish_reason is not None:
@@ -154,3 +196,116 @@ class Scheduler:
         sequence.finished_step = step
         self._finished[sequence.request_id] = sequence
         self._completion_order.append(sequence.request_id)
+
+
+class PagedScheduler(Scheduler):
+    """带 Paged KV 容量管理和 Prefill token budget 的调度器。
+
+    一轮中 Decode 具有优先级：每条 Decode 请求先消耗 1 个 token budget，剩余额度
+    再公平分给 Prefill。这里的“混合”指同一调度轮同时包含 Decode 和 Prefill 工作，
+    当前 Engine 仍按 Decode -> Prefill 两次模型调用执行，便于先讲清调度语义。
+    """
+
+    def __init__(
+        self,
+        max_num_seqs: int,
+        *,
+        block_manager: BlockManager,
+        max_num_batched_tokens: int,
+        max_prefill_chunk_size: int,
+        max_mixed_prefill_tokens: int | None,
+    ) -> None:
+        super().__init__(max_num_seqs)
+        if max_num_batched_tokens < max_num_seqs:
+            raise ValueError(
+                "max_num_batched_tokens 不能小于 max_num_seqs，"
+                "否则满载 Decode 无法保证每条请求前进一步"
+            )
+        if max_prefill_chunk_size <= 0:
+            raise ValueError("max_prefill_chunk_size 必须大于 0")
+        if (
+            max_mixed_prefill_tokens is not None
+            and max_mixed_prefill_tokens <= 0
+        ):
+            raise ValueError("max_mixed_prefill_tokens 必须大于 0")
+        self.block_manager = block_manager
+        self.max_num_batched_tokens = max_num_batched_tokens
+        self.max_prefill_chunk_size = max_prefill_chunk_size
+        self.max_mixed_prefill_tokens = max_mixed_prefill_tokens
+
+    def schedule_prefill(
+        self,
+        *,
+        step: int,
+        num_decode_tokens: int,
+    ) -> tuple[ScheduledPrefill, ...]:
+        """接纳请求，并用 Decode 后剩余的 budget 安排本轮 Prompt chunks。"""
+
+        budget = self.max_num_batched_tokens - num_decode_tokens
+        if num_decode_tokens and self.max_mixed_prefill_tokens is not None:
+            # 当前教学 Engine 的 Decode 和 Prefill 是同轮中的两次模型调用，而不是
+            # 一个融合的 token batch。若把全部剩余预算都给 Prefill，Decode 虽然先算，
+            # 下一个 token 仍会被很长的 Prefill 调用阻塞。因此混合轮使用更小的上限。
+            budget = min(budget, self.max_mixed_prefill_tokens)
+        if budget <= 0:
+            return ()
+
+        self._admit_waiting_with_blocks(step=step)
+        prefilling = self.prefilling
+        scheduled: list[ScheduledPrefill] = []
+        for index, sequence in enumerate(prefilling):
+            if budget <= 0:
+                break
+
+            # 动态 fair share 避免第一条长 Prompt 独占整轮 budget。短请求没有用完的
+            # 额度会自然留给后面的请求，因此总预算仍可尽量被利用。
+            remaining_sequences = len(prefilling) - index
+            fair_share = (budget + remaining_sequences - 1) // remaining_sequences
+            chunk_size = min(
+                sequence.num_prompt_tokens_remaining,
+                self.max_prefill_chunk_size,
+                fair_share,
+            )
+            if chunk_size <= 0:
+                continue
+
+            history_table = self.block_manager.get_block_table(
+                sequence.request_id
+            )
+            slots = self.block_manager.reserve(
+                sequence.request_id,
+                chunk_size,
+            )
+            scheduled.append(
+                ScheduledPrefill(
+                    sequence=sequence,
+                    history_table=history_table,
+                    slots=slots,
+                )
+            )
+            budget -= chunk_size
+        return tuple(scheduled)
+
+    def _admit_waiting_with_blocks(self, *, step: int) -> None:
+        """按 FIFO 接纳请求，并为完整 Prompt 预留物理容量。"""
+
+        while self.waiting and len(self.running) < self.max_num_seqs:
+            candidate = self.waiting[0]
+            required = self.block_manager.blocks_required_for_tokens(
+                len(candidate.prompt_token_ids)
+            )
+            if required > self.block_manager.num_blocks:
+                raise OutOfBlocksError(
+                    f"请求 {candidate.request_id} 的 Prompt 需要 {required} 个 "
+                    f"Block，超过物理池总量 {self.block_manager.num_blocks}"
+                )
+            if required > self.block_manager.stats.num_free_blocks:
+                # 保持 FIFO。已有请求 Decode 完成后会释放 Block，后续轮次再重试。
+                break
+
+            sequence = self.admit_waiting(step=step, max_sequences=1)[0]
+            self.block_manager.allocate(
+                sequence.request_id,
+                num_tokens=0,
+                capacity_tokens=len(sequence.prompt_token_ids),
+            )

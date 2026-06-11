@@ -109,15 +109,30 @@ class BlockManager:
         self._free_blocks: deque[int] = deque(range(num_blocks))
         self._tables: dict[int, BlockTable] = {}
 
-    def allocate(self, request_id: int, num_tokens: int = 0) -> BlockTable:
-        """注册新请求，并可一次性为 Prompt 预留所需块。"""
+    def allocate(
+        self,
+        request_id: int,
+        num_tokens: int = 0,
+        *,
+        capacity_tokens: int | None = None,
+    ) -> BlockTable:
+        """注册请求，并可让物理容量大于当前有效 token 数。
+
+        Chunked Prefill 接纳请求时会为完整 Prompt 预留容量，但 ``num_tokens`` 保持 0。
+        后续每完成一个 chunk，再通过 reserve 推进有效长度。这样既不会读取未写入槽位，
+        也避免多个半完成 Prompt 占满运行槽后因物理块不足互相等待。
+        """
 
         if request_id in self._tables:
             raise ValueError(f"request_id 已存在：{request_id}")
         if num_tokens < 0:
             raise ValueError("num_tokens 不能为负数")
+        if capacity_tokens is None:
+            capacity_tokens = num_tokens
+        if capacity_tokens < num_tokens:
+            raise ValueError("capacity_tokens 不能小于 num_tokens")
 
-        required_blocks = self._blocks_for_tokens(num_tokens)
+        required_blocks = self._blocks_for_tokens(capacity_tokens)
         self._require_free_blocks(required_blocks)
 
         # 容量检查完成后才修改内部状态，保证失败时没有半初始化请求。
@@ -147,7 +162,7 @@ class BlockManager:
         old_table = self.get_block_table(request_id)
         new_num_tokens = old_table.num_tokens + num_new_tokens
         required_total = self._blocks_for_tokens(new_num_tokens)
-        additional_blocks = required_total - old_table.num_blocks
+        additional_blocks = max(0, required_total - old_table.num_blocks)
 
         # 先检查、后分配、最后替换不可变 BlockTable。任何异常都不会改变旧映射。
         self._require_free_blocks(additional_blocks)
@@ -187,7 +202,10 @@ class BlockManager:
             required_total = self._blocks_for_tokens(
                 table.num_tokens + num_new_tokens
             )
-            total_additional_blocks += required_total - table.num_blocks
+            total_additional_blocks += max(
+                0,
+                required_total - table.num_blocks,
+            )
         self._require_free_blocks(total_additional_blocks)
 
         return {
@@ -216,7 +234,7 @@ class BlockManager:
         required_total = self._blocks_for_tokens(
             table.num_tokens + num_new_tokens
         )
-        additional = required_total - table.num_blocks
+        additional = max(0, required_total - table.num_blocks)
         return additional <= len(self._free_blocks)
 
     def blocks_required_for_tokens(self, num_tokens: int) -> int:

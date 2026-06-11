@@ -17,6 +17,7 @@ from toyvllm.engine import (
     ContinuousBatchEngine,
     ContinuousBatchResult,
     PagedContinuousBatchEngine,
+    plan_kv_cache_capacity,
 )
 from toyvllm.generation import (
     BatchGenerationResult,
@@ -69,8 +70,41 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-requests", type=int, default=8)
     parser.add_argument("--short-new-tokens", type=int, default=4)
-    parser.add_argument("--num-kv-blocks", type=int, default=64)
+    parser.add_argument(
+        "--num-kv-blocks",
+        type=int,
+        default=None,
+        help="物理 KV Block 数；默认按 GPU 显存利用率自动规划",
+    )
     parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.85,
+    )
+    parser.add_argument(
+        "--kv-cache-runtime-reserve-mib",
+        type=int,
+        default=1024,
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=None,
+        help="paged/serving 基准启用 Chunked Prefill 时的每轮 token budget",
+    )
+    parser.add_argument(
+        "--max-prefill-chunk-size",
+        type=int,
+        default=256,
+        help="单条请求每轮最多处理的 Prompt token 数",
+    )
+    parser.add_argument(
+        "--max-mixed-prefill-tokens",
+        type=int,
+        default=None,
+        help="存在 Decode 请求时，每轮 Prefill token 总上限",
+    )
     parser.add_argument(
         "--batch-sizes",
         default="1,2,4,8",
@@ -306,15 +340,37 @@ def run_serving_benchmark(
         )
         return sum(per_request[:max_num_seqs]) + max_num_seqs
 
+    if args.num_kv_blocks is None:
+        capacity_plan = plan_kv_cache_capacity(
+            loaded.model,
+            block_size=args.block_size,
+            max_num_seqs=max(batch_sizes),
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            runtime_reserve_mib=args.kv_cache_runtime_reserve_mib,
+        )
+        benchmark_num_blocks = capacity_plan.num_blocks
+        print(f"自动显存规划：{capacity_plan.format()}")
+    else:
+        capacity_plan = None
+        benchmark_num_blocks = args.num_kv_blocks
+    minimum_blocks = required_blocks(max(batch_sizes))
+    if benchmark_num_blocks < minimum_blocks:
+        raise ValueError(
+            f"当前 workload 至少需要 {minimum_blocks} 个 KV Block，"
+            f"实际规划/指定为 {benchmark_num_blocks}"
+        )
+
     def run_one(backend: str, batch_size: int) -> ContinuousBatchResult:
-        num_blocks = max(args.num_kv_blocks, required_blocks(batch_size))
         engine = PagedContinuousBatchEngine(
             loaded.model,
             max_num_seqs=batch_size,
             pad_token_id=tokenizer.pad_token_id,
-            num_blocks=num_blocks,
+            num_blocks=benchmark_num_blocks,
             block_size=args.block_size,
             attention_backend=backend,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            max_prefill_chunk_size=args.max_prefill_chunk_size,
+            max_mixed_prefill_tokens=args.max_mixed_prefill_tokens,
         )
         for prompt, limit in zip(prompts, output_limits):
             engine.add_request(
@@ -351,15 +407,17 @@ def run_serving_benchmark(
                 {
                     "cache_backend": backend,
                     "max_num_seqs": batch_size,
-                    "num_kv_blocks": max(
-                        args.num_kv_blocks,
-                        required_blocks(batch_size),
-                    ),
+                    "num_kv_blocks": benchmark_num_blocks,
                     **metrics,
                 }
             )
 
-    print("Long-context serving baseline before chunked prefill")
+    mode = (
+        "chunked prefill"
+        if args.max_num_batched_tokens is not None
+        else "full prefill baseline"
+    )
+    print(f"Long-context serving benchmark: {mode}")
     print(f"  请求数          : {args.num_requests}")
     print(f"  Prompt 长度     : {prompt_lengths}")
     print(f"  输出上限        : {output_limits}")
@@ -397,6 +455,14 @@ def run_serving_benchmark(
                 "batch_sizes": batch_sizes,
                 "warmup": warmup,
                 "block_size": args.block_size,
+                "max_num_batched_tokens": args.max_num_batched_tokens,
+                "max_prefill_chunk_size": args.max_prefill_chunk_size,
+                "max_mixed_prefill_tokens": args.max_mixed_prefill_tokens,
+                "gpu_memory_utilization": args.gpu_memory_utilization,
+                "kv_cache_runtime_reserve_mib": (
+                    args.kv_cache_runtime_reserve_mib
+                ),
+                "auto_kv_blocks": capacity_plan is not None,
             },
         )
         print(f"\n结果已追加到：{args.save}")
@@ -424,6 +490,18 @@ def run_paged_benchmark(
         for index in range(args.num_requests)
     ]
     loaded = load_model(config, device="cuda")
+    if args.num_kv_blocks is None:
+        capacity_plan = plan_kv_cache_capacity(
+            loaded.model,
+            block_size=args.block_size,
+            max_num_seqs=args.batch_size,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            runtime_reserve_mib=args.kv_cache_runtime_reserve_mib,
+        )
+        benchmark_num_blocks = capacity_plan.num_blocks
+        print(f"自动显存规划：{capacity_plan.format()}")
+    else:
+        benchmark_num_blocks = args.num_kv_blocks
     sampling_params = resolve_sampling_params(args, config)
 
     def run_engine(
@@ -435,7 +513,7 @@ def run_paged_benchmark(
             loaded.model,
             max_num_seqs=args.batch_size,
             pad_token_id=tokenizer.pad_token_id,
-            num_blocks=args.num_kv_blocks,
+            num_blocks=benchmark_num_blocks,
             block_size=args.block_size,
             attention_backend=attention_backend,
             resident_block_tables=resident_block_tables,
@@ -525,7 +603,7 @@ def run_paged_benchmark(
         "autotune_config_count": len(autotune_results),
         "selected_num_warps": selected_num_warps,
         "fastest_num_warps": fastest_num_warps,
-        "num_kv_blocks": args.num_kv_blocks,
+        "num_kv_blocks": benchmark_num_blocks,
         "block_size": args.block_size,
     }
 
@@ -533,7 +611,7 @@ def run_paged_benchmark(
     print(f"  请求数/最大并发 : {args.num_requests}/{args.batch_size}")
     print(f"  生成上限       : {limits}")
     print(
-        f"  KV Blocks      : {args.num_kv_blocks} × "
+        f"  KV Blocks      : {benchmark_num_blocks} × "
         f"{args.block_size} tokens"
     )
     print(f"  Gather + SDPA         : {gather_tps:.2f} tokens/s")

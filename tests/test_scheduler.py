@@ -26,6 +26,7 @@ class SchedulerTest(unittest.TestCase):
         self.assertEqual([sequence.request_id for sequence in admitted], [0, 1])
         self.assertEqual(third.status, SequenceStatus.WAITING)
 
+        first.advance_prefill(1)
         reason = scheduler.append_token(first, 10, step=0)
         self.assertEqual(reason, FinishReason.LENGTH)
         self.assertEqual(first.status, SequenceStatus.FINISHED)
@@ -47,6 +48,7 @@ class SchedulerTest(unittest.TestCase):
             eos_token_ids={99},
         )
         scheduler.admit_waiting(step=0)
+        sequence.advance_prefill(1)
         reason = scheduler.append_token(sequence, 99, step=1)
         self.assertEqual(reason, FinishReason.EOS)
         self.assertEqual(sequence.finished_step, 1)

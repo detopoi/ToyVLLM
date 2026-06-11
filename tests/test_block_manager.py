@@ -4,6 +4,17 @@ from toyvllm.engine import BlockManager, OutOfBlocksError
 
 
 class BlockManagerTest(unittest.TestCase):
+    def test_capacity_can_be_reserved_before_tokens_become_valid(self) -> None:
+        manager = BlockManager(num_blocks=4, block_size=2)
+        table = manager.allocate(1, num_tokens=0, capacity_tokens=5)
+
+        self.assertEqual(table.num_tokens, 0)
+        self.assertEqual(table.num_blocks, 3)
+        slots = manager.reserve(1, 2)
+        self.assertEqual(len(slots), 2)
+        self.assertEqual(manager.get_block_table(1).num_tokens, 2)
+        self.assertEqual(manager.stats.num_used_blocks, 3)
+
     def test_allocate_and_append_across_block_boundary(self) -> None:
         manager = BlockManager(num_blocks=4, block_size=4)
         table = manager.allocate(request_id=10, num_tokens=3)
