@@ -153,7 +153,9 @@ class Scheduler:
             # 状态修改和运行集合插入放在同一个方法中，维持不变量：
             # status=RUNNING 当且仅当 request_id 位于 _running。
             sequence.status = SequenceStatus.RUNNING
-            sequence.admitted_step = step
+            if sequence.admitted_step is None:
+                sequence.admitted_step = step
+            sequence.last_admitted_step = step
             self._running[sequence.request_id] = sequence
             admitted.append(sequence)
         return tuple(admitted)
@@ -232,6 +234,41 @@ class PagedScheduler(Scheduler):
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_prefill_chunk_size = max_prefill_chunk_size
         self.max_mixed_prefill_tokens = max_mixed_prefill_tokens
+        self._step_preempted_request_ids: list[int] = []
+
+    @property
+    def step_preempted_request_ids(self) -> tuple[int, ...]:
+        return tuple(self._step_preempted_request_ids)
+
+    def schedule_decode(self, *, step: int) -> tuple[Sequence, ...]:
+        """为 Decode 预留增长空间；不足时按 RECOMPUTE 策略抢占请求。"""
+
+        self._step_preempted_request_ids.clear()
+        candidates = list(self.decoding)
+        while True:
+            required_blocks = sum(
+                self.block_manager.additional_blocks_required(
+                    sequence.request_id,
+                    1,
+                )
+                for sequence in candidates
+            )
+            if required_blocks <= self.block_manager.stats.num_free_blocks:
+                return tuple(candidates)
+
+            # 优先抢占尚未输出首 token 的 Prefill 请求，避免破坏用户正在接收的流。
+            victim = self._select_preemption_victim(
+                protected_request_ids=set(),
+                prefer_prefill=True,
+            )
+            if victim is None:
+                raise OutOfBlocksError("没有可抢占请求，Decode 无法继续增长")
+            self._preempt(victim, step=step)
+            candidates = [
+                sequence
+                for sequence in candidates
+                if sequence.request_id != victim.request_id
+            ]
 
     def schedule_prefill(
         self,
@@ -253,9 +290,12 @@ class PagedScheduler(Scheduler):
         self._admit_waiting_with_blocks(step=step)
         prefilling = self.prefilling
         scheduled: list[ScheduledPrefill] = []
+        protected_request_ids: set[int] = set()
         for index, sequence in enumerate(prefilling):
             if budget <= 0:
                 break
+            if sequence.status is not SequenceStatus.RUNNING:
+                continue
 
             # 动态 fair share 避免第一条长 Prompt 独占整轮 budget。短请求没有用完的
             # 额度会自然留给后面的请求，因此总预算仍可尽量被利用。
@@ -265,6 +305,25 @@ class PagedScheduler(Scheduler):
                 sequence.num_prompt_tokens_remaining,
                 self.max_prefill_chunk_size,
                 fair_share,
+            )
+            while self.block_manager.max_reservable_tokens(
+                sequence.request_id
+            ) <= 0:
+                victim = self._select_preemption_victim(
+                    protected_request_ids=(
+                        protected_request_ids | {sequence.request_id}
+                    ),
+                    prefer_prefill=True,
+                )
+                if victim is None:
+                    break
+                self._preempt(victim, step=step)
+
+            chunk_size = min(
+                chunk_size,
+                self.block_manager.max_reservable_tokens(
+                    sequence.request_id
+                ),
             )
             if chunk_size <= 0:
                 continue
@@ -284,28 +343,68 @@ class PagedScheduler(Scheduler):
                 )
             )
             budget -= chunk_size
+            protected_request_ids.add(sequence.request_id)
         return tuple(scheduled)
 
     def _admit_waiting_with_blocks(self, *, step: int) -> None:
-        """按 FIFO 接纳请求，并为完整 Prompt 预留物理容量。"""
+        """按 FIFO 接纳请求，只注册空 BlockTable，后续按 chunk 增量分配。"""
 
         while self.waiting and len(self.running) < self.max_num_seqs:
             candidate = self.waiting[0]
             required = self.block_manager.blocks_required_for_tokens(
                 len(candidate.prompt_token_ids)
+                + candidate.max_new_tokens
+                - 1
             )
             if required > self.block_manager.num_blocks:
                 raise OutOfBlocksError(
-                    f"请求 {candidate.request_id} 的 Prompt 需要 {required} 个 "
-                    f"Block，超过物理池总量 {self.block_manager.num_blocks}"
+                    f"请求 {candidate.request_id} 的最大上下文需要 {required} 个 "
+                    f"Block，超过物理池总量 {self.block_manager.num_blocks}；"
+                    "该请求即使独占 GPU 也无法完成"
                 )
-            if required > self.block_manager.stats.num_free_blocks:
-                # 保持 FIFO。已有请求 Decode 完成后会释放 Block，后续轮次再重试。
-                break
+
+            if candidate.preemption_count:
+                recompute_blocks = self.block_manager.blocks_required_for_tokens(
+                    candidate.prefill_target_length
+                )
+                if recompute_blocks > self.block_manager.stats.num_free_blocks:
+                    # 被抢占请求如果只拿到一小块空间就立即恢复，很可能在下一轮再次
+                    # 被抢占，形成 recompute thrashing。等完整重算工作集可容纳时再重入。
+                    break
 
             sequence = self.admit_waiting(step=step, max_sequences=1)[0]
             self.block_manager.allocate(
                 sequence.request_id,
                 num_tokens=0,
-                capacity_tokens=len(sequence.prompt_token_ids),
             )
+
+    def _select_preemption_victim(
+        self,
+        *,
+        protected_request_ids: set[int],
+        prefer_prefill: bool,
+    ) -> Sequence | None:
+        """选择最新进入 RUNNING 的低优先级请求。
+
+        同类请求使用 LIFO：保留更早到达的请求继续前进，减少反复抢占造成的饥饿。
+        """
+
+        candidates = [
+            sequence
+            for sequence in reversed(self.running)
+            if sequence.request_id not in protected_request_ids
+        ]
+        if prefer_prefill:
+            for sequence in candidates:
+                if not sequence.is_prefill_complete:
+                    return sequence
+        return candidates[0] if candidates else None
+
+    def _preempt(self, sequence: Sequence, *, step: int) -> None:
+        """执行 RECOMPUTE 抢占：释放 KV，保留输出，并放回等待队首。"""
+
+        del self._running[sequence.request_id]
+        self.block_manager.free(sequence.request_id)
+        sequence.preempt_for_recompute(step=step)
+        self._waiting.appendleft(sequence)
+        self._step_preempted_request_ids.append(sequence.request_id)

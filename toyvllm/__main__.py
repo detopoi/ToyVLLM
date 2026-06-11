@@ -352,6 +352,7 @@ def main() -> None:
         print(f"调度轮数：{len(result.iterations)}")
         print(f"总输出吞吐：{result.output_tokens_per_second:.2f} tokens/s")
         print(f"请求吞吐：{result.requests_per_second:.2f} requests/s")
+        print(f"抢占次数：{result.total_preemptions}")
         print(f"完成顺序：{list(result.completion_order)}")
         print(f"峰值显存：{result.peak_memory_mib:.1f} MiB")
         if args.cache_backend == "paged":
@@ -368,11 +369,16 @@ def main() -> None:
                     f"step={iteration.step:02d} "
                     f"decode={list(iteration.decode_request_ids)} "
                     "prefill="
-                    f"{list(zip(iteration.prefill_request_ids, iteration.prefill_token_counts))}"
+                    f"{list(zip(iteration.prefill_request_ids, iteration.prefill_token_counts))} "
+                    f"preempted={list(iteration.preempted_request_ids)}"
                 )
 
         for sequence in result.sequences:
-            print(f"\n[{sequence.request_id}] {args.prompts[sequence.request_id]}")
+            print(
+                f"\n[{sequence.request_id}] "
+                f"preemptions={sequence.preemption_count} "
+                f"{args.prompts[sequence.request_id]}"
+            )
             print(
                 tokenizer.decode(
                     sequence.output_token_ids,
