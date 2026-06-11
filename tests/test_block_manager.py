@@ -85,6 +85,100 @@ class BlockManagerTest(unittest.TestCase):
         self.assertEqual(manager.get_block_table(2), second)
         self.assertEqual(manager.free_block_ids, (2,))
 
+    def test_prefix_cache_reuses_complete_blocks_and_keeps_tail_for_logits(self) -> None:
+        manager = BlockManager(
+            num_blocks=4,
+            block_size=2,
+            enable_prefix_cache=True,
+        )
+        prompt = [10, 11, 12, 13, 14]
+
+        manager.allocate(1)
+        manager.reserve(1, len(prompt))
+        self.assertEqual(manager.cache_computed_prompt_blocks(1, prompt), 2)
+        first_blocks = manager.get_block_table(1).physical_block_ids
+        manager.free(1)
+
+        manager.allocate(2)
+        hit_tokens = manager.attach_cached_prefix(2, prompt)
+        second = manager.get_block_table(2)
+
+        # 长度 5 的 Prompt 可复用前 4 个 token；最后 token 必须重算以产生 logits。
+        self.assertEqual(hit_tokens, 4)
+        self.assertEqual(second.physical_block_ids, first_blocks[:2])
+        self.assertEqual(second.num_tokens, 4)
+        self.assertEqual(manager.stats.num_prefix_cache_hit_tokens, 4)
+
+    def test_prefix_cache_does_not_reuse_the_final_prompt_block(self) -> None:
+        manager = BlockManager(
+            num_blocks=3,
+            block_size=2,
+            enable_prefix_cache=True,
+        )
+        prompt = [1, 2, 3, 4]
+        manager.allocate(1)
+        manager.reserve(1, len(prompt))
+        manager.cache_computed_prompt_blocks(1, prompt)
+        manager.free(1)
+
+        manager.allocate(2)
+        self.assertEqual(manager.attach_cached_prefix(2, prompt), 2)
+
+    def test_prefix_key_depends_on_all_previous_blocks(self) -> None:
+        manager = BlockManager(
+            num_blocks=4,
+            block_size=2,
+            enable_prefix_cache=True,
+        )
+        manager.allocate(1)
+        manager.reserve(1, 4)
+        manager.cache_computed_prompt_blocks(1, [1, 2, 3, 4])
+        manager.free(1)
+
+        manager.allocate(2)
+        # 第二个 block 虽然同为 [3, 4]，但前置上下文不同，不能从中间开始命中。
+        self.assertEqual(
+            manager.attach_cached_prefix(2, [8, 9, 3, 4, 5]),
+            0,
+        )
+
+    def test_lru_cache_block_is_evicted_when_allocator_needs_space(self) -> None:
+        manager = BlockManager(
+            num_blocks=2,
+            block_size=2,
+            enable_prefix_cache=True,
+        )
+        manager.allocate(1)
+        manager.reserve(1, 2)
+        manager.cache_computed_prompt_blocks(1, [1, 2])
+        manager.free(1)
+        self.assertEqual(manager.stats.num_free_blocks, 1)
+        self.assertEqual(manager.stats.num_evictable_cached_blocks, 1)
+
+        # 两块新容量会消耗普通空闲块，并淘汰已经没有活跃引用的缓存块。
+        manager.allocate(2, num_tokens=4)
+        self.assertEqual(manager.stats.num_prefix_cache_evictions, 1)
+        self.assertEqual(manager.stats.num_cached_blocks, 0)
+
+    def test_active_shared_cache_block_cannot_be_evicted(self) -> None:
+        manager = BlockManager(
+            num_blocks=2,
+            block_size=2,
+            enable_prefix_cache=True,
+        )
+        prompt = [1, 2, 3]
+        manager.allocate(1)
+        manager.reserve(1, 2)
+        manager.cache_computed_prompt_blocks(1, prompt)
+        manager.free(1)
+
+        manager.allocate(2)
+        self.assertEqual(manager.attach_cached_prefix(2, prompt), 2)
+        manager.allocate(3, num_tokens=2)
+
+        with self.assertRaises(OutOfBlocksError):
+            manager.allocate(4, num_tokens=2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -47,6 +47,7 @@ def main() -> None:
             "static",
             "continuous",
             "paged",
+            "prefix",
             "serving",
         ),
         default="tokenizer",
@@ -116,6 +117,12 @@ def main() -> None:
         help="serving 基准循环使用的精确 Prompt token 长度",
     )
     parser.add_argument(
+        "--prefix-prompt-length",
+        type=int,
+        default=513,
+        help="prefix 基准的精确 Prompt 长度；默认让热请求只需重算 1 token",
+    )
+    parser.add_argument(
         "--save",
         default=None,
         help="可选的 JSONL 结果文件，例如 benchmarks/results.jsonl",
@@ -125,6 +132,9 @@ def main() -> None:
     tokenizer = Tokenizer(args.model)
     if args.backend == "serving":
         run_serving_benchmark(args, tokenizer)
+        return
+    if args.backend == "prefix":
+        run_prefix_cache_benchmark(args, tokenizer)
         return
     if args.backend == "paged":
         run_paged_benchmark(args, tokenizer)
@@ -687,6 +697,180 @@ def run_paged_benchmark(
                 "warmup": warmup,
                 "decoding": (
                     "greedy" if sampling_params.is_greedy else "sampling"
+                ),
+            },
+        )
+        print(f"\n结果已追加到：{args.save}")
+
+
+def run_prefix_cache_benchmark(
+    args: argparse.Namespace,
+    tokenizer: Tokenizer,
+) -> None:
+    """在同一个 Engine 中依次测量冷 Prompt 和重复热 Prompt。"""
+
+    if args.prefix_prompt_length <= args.block_size:
+        raise ValueError("--prefix-prompt-length 必须大于一个 Block")
+    warmup = 0 if args.warmup is None else args.warmup
+    iterations = 3 if args.iterations is None else args.iterations
+    if warmup < 0 or iterations <= 0:
+        raise ValueError("--warmup 不能为负，--iterations 必须大于 0")
+
+    config = ModelConfig.from_pretrained(args.model)
+    sampling_params = resolve_sampling_params(args, config)
+    prompt_ids = make_exact_length_prompt(
+        tokenizer,
+        args.prefix_prompt_length,
+        variant=0,
+    )
+    loaded = load_model(config, device="cuda")
+    token_budget = args.max_num_batched_tokens or 512
+    chunk_size = min(args.max_prefill_chunk_size, token_budget)
+    if args.num_kv_blocks is None:
+        capacity_plan = plan_kv_cache_capacity(
+            loaded.model,
+            block_size=args.block_size,
+            max_num_seqs=1,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            runtime_reserve_mib=args.kv_cache_runtime_reserve_mib,
+        )
+        benchmark_num_blocks = capacity_plan.num_blocks
+        print(f"自动显存规划：{capacity_plan.format()}")
+    else:
+        benchmark_num_blocks = args.num_kv_blocks
+
+    required_blocks = (
+        len(prompt_ids) + args.max_new_tokens - 1 + args.block_size - 1
+    ) // args.block_size
+    if benchmark_num_blocks < required_blocks:
+        raise ValueError(
+            f"当前请求至少需要 {required_blocks} 个 KV Block，"
+            f"实际只有 {benchmark_num_blocks}"
+        )
+
+    engine = PagedContinuousBatchEngine(
+        loaded.model,
+        max_num_seqs=1,
+        pad_token_id=tokenizer.pad_token_id,
+        num_blocks=benchmark_num_blocks,
+        block_size=args.block_size,
+        attention_backend="triton",
+        max_num_batched_tokens=token_budget,
+        max_prefill_chunk_size=chunk_size,
+        enable_prefix_cache=True,
+    )
+
+    def run_request() -> dict[str, object]:
+        request_id = engine.add_request(
+            prompt_ids,
+            max_new_tokens=args.max_new_tokens,
+            eos_token_ids=set(),
+            sampling_params=sampling_params,
+        )
+        sequence = engine.scheduler.waiting[-1]
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        started = time.perf_counter()
+        ttft_seconds: float | None = None
+        prefill_tokens = 0
+        while not engine.scheduler.is_done:
+            iteration = engine.step()
+            prefill_tokens += sum(
+                count
+                for current_id, count in zip(
+                    iteration.prefill_request_ids,
+                    iteration.prefill_token_counts,
+                )
+                if current_id == request_id
+            )
+            if ttft_seconds is None and sequence.output_token_ids:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                ttft_seconds = time.perf_counter() - started
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return {
+            "ttft_ms": (ttft_seconds or 0.0) * 1000,
+            "e2e_ms": (time.perf_counter() - started) * 1000,
+            "prefill_tokens": prefill_tokens,
+            "hit_tokens": sequence.prefix_cache_hit_tokens,
+            "output_token_ids": tuple(sequence.output_token_ids),
+        }
+
+    cold = run_request()
+    for _ in range(warmup):
+        run_request()
+    warm_results = [run_request() for _ in range(iterations)]
+    if any(
+        result["output_token_ids"] != cold["output_token_ids"]
+        for result in warm_results
+    ):
+        raise RuntimeError("Prefix Cache 热请求输出与冷请求不一致")
+
+    warm_ttft_ms = statistics.fmean(
+        float(result["ttft_ms"]) for result in warm_results
+    )
+    warm_e2e_ms = statistics.fmean(
+        float(result["e2e_ms"]) for result in warm_results
+    )
+    hit_tokens = int(warm_results[0]["hit_tokens"])
+    cache_stats = engine.block_manager.prefix_cache_stats
+    metrics = {
+        "backend": "prefix",
+        "prompt_tokens": len(prompt_ids),
+        "cold_ttft_ms": float(cold["ttft_ms"]),
+        "warm_ttft_ms": warm_ttft_ms,
+        "ttft_speedup": float(cold["ttft_ms"]) / warm_ttft_ms,
+        "cold_e2e_ms": float(cold["e2e_ms"]),
+        "warm_e2e_ms": warm_e2e_ms,
+        "e2e_speedup": float(cold["e2e_ms"]) / warm_e2e_ms,
+        "cold_prefill_tokens": int(cold["prefill_tokens"]),
+        "warm_prefill_tokens": int(warm_results[0]["prefill_tokens"]),
+        "prefix_cache_hit_tokens": hit_tokens,
+        "cached_blocks": cache_stats.num_cached_blocks,
+        "cache_evictions": cache_stats.num_evictions,
+        "num_kv_blocks": benchmark_num_blocks,
+        "block_size": args.block_size,
+        "iterations": iterations,
+    }
+
+    print("Prefix Cache cold/warm benchmark")
+    print(f"  Prompt tokens      : {len(prompt_ids)}")
+    print(
+        f"  冷/热 Prefill token: {metrics['cold_prefill_tokens']} / "
+        f"{metrics['warm_prefill_tokens']}"
+    )
+    print(f"  热请求命中 token   : {hit_tokens}")
+    print(
+        f"  冷/热 TTFT         : {metrics['cold_ttft_ms']:.2f} / "
+        f"{warm_ttft_ms:.2f} ms ({metrics['ttft_speedup']:.2f}x)"
+    )
+    print(
+        f"  冷/热 E2E          : {metrics['cold_e2e_ms']:.2f} / "
+        f"{warm_e2e_ms:.2f} ms ({metrics['e2e_speedup']:.2f}x)"
+    )
+    print(
+        f"  缓存 Blocks/淘汰   : {cache_stats.num_cached_blocks} / "
+        f"{cache_stats.num_evictions}"
+    )
+
+    if args.save:
+        append_record(
+            args.save,
+            label=args.label or "stage-10i-prefix-cache",
+            metrics=metrics,
+            metadata={
+                "model": args.model,
+                "max_new_tokens": args.max_new_tokens,
+                "warmup": warmup,
+                "decoding": (
+                    "greedy" if sampling_params.is_greedy else "sampling"
+                ),
+                "token_budget": token_budget,
+                "max_prefill_chunk_size": chunk_size,
+                "gpu_memory_utilization": args.gpu_memory_utilization,
+                "kv_cache_runtime_reserve_mib": (
+                    args.kv_cache_runtime_reserve_mib
                 ),
             },
         )

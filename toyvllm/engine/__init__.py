@@ -27,6 +27,7 @@ if TYPE_CHECKING:
         calculate_kv_cache_capacity,
         plan_kv_cache_capacity,
     )
+    from toyvllm.engine.prefix_cache import PrefixCacheStats
     from toyvllm.engine.scheduler import PagedScheduler, ScheduledPrefill, Scheduler
     from toyvllm.engine.sequence import FinishReason, Sequence, SequenceStatus
 
@@ -43,6 +44,7 @@ __all__ = [
     "PagedScheduler",
     "PagedContinuousBatchEngine",
     "PhysicalTokenSlot",
+    "PrefixCacheStats",
     "ScheduledPrefill",
     "Scheduler",
     "Sequence",
@@ -86,6 +88,10 @@ def __getattr__(name: str) -> Any:
         from toyvllm.engine import memory_planner
 
         return getattr(memory_planner, name)
+    if name == "PrefixCacheStats":
+        from toyvllm.engine import prefix_cache
+
+        return prefix_cache.PrefixCacheStats
     if name in {"FinishReason", "Sequence", "SequenceStatus"}:
         from toyvllm.engine import sequence
 

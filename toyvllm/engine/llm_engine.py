@@ -65,6 +65,12 @@ class ContinuousBatchResult:
     def total_preemptions(self) -> int:
         return sum(sequence.preemption_count for sequence in self.sequences)
 
+    @property
+    def total_prefix_cache_hit_tokens(self) -> int:
+        return sum(
+            sequence.prefix_cache_hit_tokens for sequence in self.sequences
+        )
+
 
 class ContinuousBatchEngine:
     """动态重组 batch 的教学版连续批处理引擎。
@@ -546,6 +552,7 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
         max_num_batched_tokens: int | None = None,
         max_prefill_chunk_size: int = 256,
         max_mixed_prefill_tokens: int | None = None,
+        enable_prefix_cache: bool = False,
     ) -> None:
         super().__init__(
             model,
@@ -569,9 +576,13 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
         self.num_blocks = num_blocks
         self.gpu_memory_utilization = gpu_memory_utilization
         self.kv_cache_runtime_reserve_mib = kv_cache_runtime_reserve_mib
+        if enable_prefix_cache and max_num_batched_tokens is None:
+            raise ValueError("Prefix Cache 依赖 Chunked Prefill，请设置 token budget")
+        self.enable_prefix_cache = enable_prefix_cache
         self.block_manager = BlockManager(
             num_blocks=num_blocks,
             block_size=block_size,
+            enable_prefix_cache=enable_prefix_cache,
         )
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_prefill_chunk_size = max_prefill_chunk_size
@@ -872,6 +883,12 @@ class PagedContinuousBatchEngine(ContinuousBatchEngine):
                 )
             self.paged_cache.write(chunk.slots, layer_values)
             chunk.sequence.advance_prefill(chunk.num_tokens)
+            # 只有 K/V 真正写入 GPU 后，完整 Prompt block 才能发布给其他请求复用。
+            # 先更新有效长度再登记，可以保证 Prefix Cache 永远不指向半写入数据。
+            self.block_manager.cache_computed_prompt_blocks(
+                chunk.sequence.request_id,
+                chunk.sequence.prompt_token_ids,
+            )
 
         completed_indices = [
             index

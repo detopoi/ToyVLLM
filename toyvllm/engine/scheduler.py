@@ -253,7 +253,7 @@ class PagedScheduler(Scheduler):
                 )
                 for sequence in candidates
             )
-            if required_blocks <= self.block_manager.stats.num_free_blocks:
+            if required_blocks <= self.block_manager.stats.num_allocatable_blocks:
                 return tuple(candidates)
 
             # 优先抢占尚未输出首 token 的 Prefill 请求，避免破坏用户正在接收的流。
@@ -364,10 +364,20 @@ class PagedScheduler(Scheduler):
                 )
 
             if candidate.preemption_count:
+                cached_tokens = self.block_manager.cached_prefix_tokens(
+                    candidate.prompt_token_ids
+                )
                 recompute_blocks = self.block_manager.blocks_required_for_tokens(
                     candidate.prefill_target_length
                 )
-                if recompute_blocks > self.block_manager.stats.num_free_blocks:
+                cached_blocks = self.block_manager.blocks_required_for_tokens(
+                    cached_tokens
+                )
+                required_new_blocks = max(0, recompute_blocks - cached_blocks)
+                if (
+                    required_new_blocks
+                    > self.block_manager.stats.num_allocatable_blocks
+                ):
                     # 被抢占请求如果只拿到一小块空间就立即恢复，很可能在下一轮再次
                     # 被抢占，形成 recompute thrashing。等完整重算工作集可容纳时再重入。
                     break
@@ -377,6 +387,12 @@ class PagedScheduler(Scheduler):
                 sequence.request_id,
                 num_tokens=0,
             )
+            cached_tokens = self.block_manager.attach_cached_prefix(
+                sequence.request_id,
+                sequence.prompt_token_ids,
+            )
+            if cached_tokens:
+                sequence.restore_cached_prefix(cached_tokens)
 
     def _select_preemption_victim(
         self,
